@@ -8,7 +8,7 @@ from supabase import create_client
 
 app = Flask(__name__)
 
-# env variables for api access 
+# test env variables for api access 
 print("URL:", os.getenv("SUPABASE_URL"))
 print("KEY:", os.getenv("SUPABASE_KEY"))
 
@@ -28,20 +28,24 @@ def authenticate():
     username = data.get("username")
     raw_data = data.get("raw_data")
 
+    # basic error handling 
     if not username:
         return jsonify({"status": "error", "message": "missing username"}), 400
 
     if raw_data is None:
         return jsonify({"status": "error", "message": "missing raw_data"}), 400
 
+    # query user_profiles table to check user exists. filler test. 
     user = supabase.table("user_profiles") \
         .select("*") \
         .eq("username", username) \
         .execute()
 
+    # user not found
     if not user.data:
         return jsonify({"status": "user not found"}), 200
 
+    # defaulting to 2fa required until ML engine is up. 
     return jsonify({
         "status": "2fa required"
     }), 200
