@@ -12,20 +12,20 @@ from supabase import create_client
 
 app = Flask(__name__)
 
-# test env variables for api access 
-print("URL:", os.getenv("SUPABASE_URL"))
-print("KEY:", os.getenv("SUPABASE_KEY"))
-
+# start supabase client 
 supabase = create_client(
     os.getenv("SUPABASE_URL").strip(),
     os.getenv("SUPABASE_KEY").strip()
 )
 
+
+# health check endpoint 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# main endpoint 1: client calls with username and raw data, gets accepted or sent to 2fa.  
+
+# MAIN ENDPOINT 1: client calls with username and raw data, gets accepted or sent to 2fa.  
 @app.post("/authenticate")
 def authenticate():
     data = request.json
@@ -45,7 +45,7 @@ def authenticate():
         .eq("username", username) \
         .execute()
 
-    # user not found
+    # if user not found
     if not user.data:
         return jsonify({"status": "user not found"}), 200
 
