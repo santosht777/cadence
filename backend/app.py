@@ -82,7 +82,11 @@ def signup():
     if existing_user.data:
         return jsonify({"status": "error", "message": "username already exists"}), 400
 
-    sign_up_result = _supabase_sign_up(email, password)
+    try:
+        sign_up_result = _supabase_sign_up(email, password)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
     print("SIGN UP RESULT:", sign_up_result)
     sign_up_error = None
     sign_up_user = None
@@ -101,6 +105,9 @@ def signup():
         user_id = sign_up_user.get("id")
     else:
         user_id = getattr(sign_up_user, "id", None)
+
+    if not user_id:
+        return jsonify({"status": "error", "message": "signup did not return user id"}), 400
 
     print({
         "user_id": user_id,
@@ -172,7 +179,11 @@ def authenticate():
 
     # verify username/password against Supabase auth
     email = user_profile.get("email")
-    sign_in_result = _supabase_sign_in(email, password)
+    try:
+        sign_in_result = _supabase_sign_in(email, password)
+    except Exception:
+        return jsonify({"status": "error", "message": "invalid credentials"}), 401
+
     sign_in_error = None
     if isinstance(sign_in_result, dict):
         sign_in_error = sign_in_result.get("error")
