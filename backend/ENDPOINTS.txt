@@ -1,0 +1,278 @@
+================================================================================
+CADENCE AUTHENTICATION API ENDPOINTS
+================================================================================
+
+1. HEALTH CHECK ENDPOINTS
+================================================================================
+
+GET /health
+-----------
+Purpose: Basic service health check
+Response: {"status": "ok"}
+Status Code: 200
+
+
+GET /model/health
+-----------------
+Purpose: Check if ML model is loaded and ready
+Response: {
+  "model_path": "string",
+  "metrics_path": "string", 
+  "model_exists": boolean,
+  "metrics_exists": boolean,
+  "loaded_lengths": [array of sequence lengths]
+}
+Status Code: 200
+
+
+2. AUTHENTICATION ENDPOINTS
+================================================================================
+
+POST /signup
+------------------
+Purpose: Register a new user through Supabase email/password auth and create a local profile.
+
+Request Body:
+{
+  "email": "string (required)",
+  "password": "string (required)",
+  "username": "string (required)"
+}
+
+Responses:
+- Signup success:
+  {"status": "signup_success", "user_id": "uuid"} - 200
+- Email already exists or other auth error:
+  {"status": "error", "message": "..."} - 400
+- Error (missing field):
+  {"status": "error", "message": "missing email" | "missing password" | "missing username"} - 400
+
+
+POST /authenticate
+------------------
+Purpose: Attempt login with username/password and keystroke biometrics. On success, user is logged in.
+         On failure, 2FA is triggered.
+
+Request Body:
+{
+  "username": "string (required)",
+  "password": "string (required)",
+  "raw_data": "array or object (required) - keystroke timing data"
+}
+
+raw_data Format (either):
+- List of keystroke objects:
+  {
+    "keystrokes": [
+      {"hold_time": float, "flight_time": float, "down_down": float},
+      ...
+    ]
+  }
+- List of keyboard events:
+  {
+    "events": [
+      {"type": "down" | "up", "code": "string", "t": float},
+      ...
+    ]
+  }
+
+Responses:
+- User not found:
+  {"status": "user not found"} - 200
+  
+- Already logged in:
+  {"status": "logged in"} - 200
+  
+- Pending 2FA from prior attempt:
+  {"status": "pending 2fa"} - 200
+  
+- Account locked due to failed 2FA attempts:
+  {"status": "account is locked"} - 200
+  
+- ML score accepted (user logged in):
+  {"status": "accepted"} - 200
+  
+- ML score rejected (2FA required):
+  {"status": "2fa required"} - 200
+  
+- No enrollment data:
+  {"status": "no score available"} - 200
+  
+- Error (missing field):
+  {"status": "error", "message": "missing username" | "missing raw_data"} - 400
+
+
+POST /code_verification
+-----------------------
+Purpose: Verify the one-time code sent to user's email to complete login
+
+Request Body:
+{
+  "username": "string (required)",
+  "code": "string (required) - 6-digit code from email",
+  "login_attempt_id": "string (required) - returned from /authenticate response"
+}
+
+Responses:
+- Code too many attempts:
+  {"status": "rejected", "message": "max attempts exceeded"} - 200
+  Account is now locked.
+  
+- Invalid attempt ID or username mismatch:
+  {"status": "rejected", "message": "invalid attempt"} - 200
+  
+- Wrong code (attempt count incremented):
+  {"status": "rejected"} - 200
+  
+- Code expired (> 5 minutes old):
+  {"status": "rejected", "message": "expired"} - 200
+  
+- Code verified successfully (user logged in):
+  {"status": "accepted"} - 200
+  
+- Error (missing field):
+  {"status": "error", "message": "missing username" | "missing code" | "missing login_attempt_id"} - 400
+
+
+POST /resend_code
+-----------------
+Purpose: Resend a 2FA code to the user's email. Generates a new code and resets attempt counter.
+
+Request Body:
+{
+  "username": "string (required)",
+  "login_attempt_id": "string (required) - from the pending 2FA attempt"
+}
+
+Responses:
+- Code sent successfully (new code generated and sent):
+  {"status": "code sent"} - 200
+  
+- Invalid attempt ID or username mismatch:
+  {"status": "invalid attempt"} - 200
+  
+- Error (missing field):
+  {"status": "error", "message": "missing username" | "missing login_attempt_id"} - 400
+
+Note: This endpoint generates a fresh code with a new 5-minute expiration and resets
+the attempt_count to 0, allowing the user another 3 attempts.
+
+
+3. LOGIN STATUS FIELD
+================================================================================
+
+The user_profiles table has a "current_login_status" column with values:
+- "logged in"    : User successfully authenticated
+- "pending 2fa"  : ML score rejected, 2FA code sent, awaiting verification
+- "locked"       : Account locked due to 3 failed 2FA attempts
+- null           : Initial state before any login attempt
+
+
+4. REQUEST/RESPONSE FLOW EXAMPLE
+================================================================================
+
+Step 1: Keystroke Login Attempt
+POST /authenticate
+{
+  "username": "alice",
+  "raw_data": {"keystrokes": [...]}
+}
+
+Response (2FA required):
+{"status": "2fa required"}
+
+Database Updates:
+- current_login_status set to "pending 2fa"
+- login_attempt record created
+- _2fa record created with OTP hash and attempt_count=0
+- Email sent to alice@example.com
+
+
+Step 2: User enters code from email
+POST /code_verification
+{
+  "username": "alice",
+  "code": "123456",
+  "login_attempt_id": "uuid-from-step1"
+}
+
+Response (success):
+{"status": "accepted"}
+
+Database Updates:
+- current_login_status set to "logged in"
+- _2fa record deleted (can't reuse code)
+- login_attempts marked successful_login=True
+
+
+Step 3: User tries to login again while logged in
+POST /authenticate
+{
+  "username": "alice",
+  "raw_data": {"keystrokes": [...]}
+}
+
+Response:
+{"status": "logged in"}
+
+No database changes.
+
+
+5. RETRY LOGIC
+================================================================================
+
+When verifying 2FA code:
+- Attempt 1: Code attempt 1/3
+- Attempt 2: Code attempt 2/3
+- Attempt 3: Code attempt 3/3
+- Attempt 4+: Rejected with "max attempts exceeded"
+             Account marked as "locked"
+
+Each code submission increments attempt_count in _2fa table, regardless of 
+whether the code is correct or incorrect. After 3 attempts, further attempts
+are rejected and the account is locked.
+
+
+6. ML SCORING
+================================================================================
+
+ML Model Requirements:
+- Input: Keystroke sequences with 3 timing features per keystroke
+  [hold_time, flight_time, down_down]
+- Output: Similarity score between 0.0 and 1.0 (higher = more similar to enrollment)
+- Enrollment: Uses the user's previous successful login attempts
+- Threshold: Retrieved from user_profiles table for each user
+
+Score Decision:
+- score >= user_threshold → Accept login, set status to "logged in"
+- score < user_threshold → Trigger 2FA, set status to "pending 2fa"
+
+
+7. DATA MODELS
+================================================================================
+
+user_profiles table:
+- username: unique identifier for login
+- email: for 2FA code delivery
+- threshold: ML similarity threshold for this user
+- current_login_status: "logged in" | "pending 2fa" | "locked" | null
+- number_login_attempts: counter for tracking login history
+- Additional fields as needed
+
+login_attempts table:
+- login_attempt_id: unique identifier for this login session
+- username: which user attempted login
+- login_number: sequence number for this user
+- two_fa_invoked: boolean, set when 2FA is required
+- successful_login: boolean, set when login completed successfully
+- confidence_score: ML similarity score
+- raw_data: the keystroke data submitted
+
+_2fa table:
+- login_attempt_id: links to login_attempts
+- username: which user this code is for
+- otp_hash: SHA256 hash of the 6-digit code
+- expires_at: timestamp when code expires (5 minutes)
+- attempt_count: counter for verification attempts (max 3)
+
+================================================================================
