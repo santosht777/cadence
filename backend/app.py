@@ -482,4 +482,4 @@ def send_code(user_id, username, login_attempt_id):
     
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
