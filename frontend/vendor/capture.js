@@ -25,10 +25,13 @@ export function createCapture(options) {
     let timingResolutionMs = 0;
     let events = [];
     const pressed = new Map();
+    const ignoredKeyUps = new Set();
     let untrusted = 0;
     const flags = new Set();
     let isComposing = false;
     let lastKeyDownTime = 0;
+    let ignoreInputsUntilNextKeydown = false;
+    let blurTimer;
     const isLive = () => state === 'CAPTURING' || state === 'POISONED';
     const raiseFlag = (name) => {
         flags.add(name);
@@ -41,6 +44,24 @@ export function createCapture(options) {
         const lastT = events[events.length - 1].t_raw;
         if (ts - lastT > maxInterKeyPauseMs)
             raiseFlag('inter_key_pause_exceeded');
+    };
+    const isDeletionKey = (code) => code === 'Backspace' || code === 'Delete';
+    const clearEditableValue = () => {
+        if (options.target instanceof HTMLInputElement ||
+            options.target instanceof HTMLTextAreaElement) {
+            options.target.value = '';
+        }
+    };
+    const restartAfterDeletion = (ev, code) => {
+        const keysToIgnore = new Set(pressed.keys());
+        keysToIgnore.add(code);
+        ev.preventDefault();
+        clearEditableValue();
+        resetBuffers();
+        state = 'CAPTURING';
+        for (const key of keysToIgnore)
+            ignoredKeyUps.add(key);
+        ignoreInputsUntilNextKeydown = true;
     };
     const onKeyDown = (ev) => {
         if (!isLive())
@@ -64,6 +85,11 @@ export function createCapture(options) {
         checkInterKeyPause(ev.timeStamp);
         lastKeyDownTime = ev.timeStamp;
         const code = ev.code;
+        if (isDeletionKey(code)) {
+            restartAfterDeletion(ev, code);
+            return;
+        }
+        ignoreInputsUntilNextKeydown = false;
         // Drop OS-level auto-repeat. The pressed map is authoritative;
         // event.repeat is inconsistent across platforms.
         if (pressed.has(code))
@@ -85,6 +111,8 @@ export function createCapture(options) {
             return;
         checkInterKeyPause(ev.timeStamp);
         const code = ev.code;
+        if (ignoredKeyUps.delete(code))
+            return;
         const t = ev.timeStamp;
         // Orphan keyups (no matching keydown) are still recorded — the
         // model may want to see them.
@@ -110,7 +138,15 @@ export function createCapture(options) {
     const onBlur = () => {
         if (!isLive())
             return;
-        raiseFlag('focus_lost');
+        if (options.mode !== 'freetext')
+            return;
+        if (blurTimer !== undefined)
+            window.clearTimeout(blurTimer);
+        blurTimer = window.setTimeout(() => {
+            blurTimer = undefined;
+            if (isLive())
+                raiseFlag('focus_lost');
+        }, 0);
     };
     const onVisibilityChange = () => {
         if (!isLive())
@@ -130,6 +166,10 @@ export function createCapture(options) {
     const onInput = (ev) => {
         if (!isLive())
             return;
+        if (ignoreInputsUntilNextKeydown) {
+            clearEditableValue();
+            return;
+        }
         // Heuristic: an input event with no recent keydown is autofill (or
         // context-menu paste, which we don't otherwise detect). Err toward
         // false negatives: require *no* keydown activity within the
@@ -179,12 +219,18 @@ export function createCapture(options) {
         listenersAttached = false;
     };
     const resetBuffers = () => {
+        if (blurTimer !== undefined) {
+            window.clearTimeout(blurTimer);
+            blurTimer = undefined;
+        }
         events = [];
         pressed.clear();
+        ignoredKeyUps.clear();
         untrusted = 0;
         flags.clear();
         isComposing = false;
         lastKeyDownTime = 0;
+        ignoreInputsUntilNextKeydown = false;
     };
     const finalize = () => {
         if (events.length === 0) {

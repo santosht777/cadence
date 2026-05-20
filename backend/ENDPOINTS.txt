@@ -190,14 +190,33 @@ Note: This endpoint generates a fresh code with a new 5-minute expiration and re
 the attempt_count to 0, allowing the user another 3 attempts.
 
 
+POST /logout
+------------
+Purpose: Clear the user's logged-in status so the next login attempt must run
+         password and keystroke verification again.
+
+Request Body:
+{
+  "username": "string (required)"
+}
+
+Responses:
+- Logout success:
+  {"status": "logged out"} - 200
+- User not found:
+  {"status": "user not found"} - 200
+- Error (missing field):
+  {"status": "error", "message": "missing username"} - 400
+
+
 3. LOGIN STATUS FIELD
 ================================================================================
 
 The user_profiles table has a "current_login_status" column with values:
-- "logged in"    : User successfully authenticated
+- "logged in"    : User successfully authenticated. /logout clears this back to null.
 - "pending 2fa"  : ML score rejected, 2FA code sent, awaiting verification
 - "locked"       : Account locked due to 3 failed 2FA attempts
-- null           : Initial state, or enrollment still needs more samples
+- null           : Initial state, logged out, or enrollment still needs more samples
 
 
 4. REQUEST/RESPONSE FLOW EXAMPLE
@@ -254,7 +273,7 @@ Repeat steps 1-2 until enrollment_count reaches 5. The 5th successful
 verification returns enrolled=true and sets current_login_status to "logged in".
 
 
-Step 3: User tries to login again while logged in
+Step 3: User tries to login again while still marked logged in
 POST /authenticate
 {
   "username": "alice",
@@ -265,6 +284,19 @@ Response:
 {"status": "logged in"}
 
 No database changes.
+
+
+Step 4: User logs out
+POST /logout
+{
+  "username": "alice"
+}
+
+Response:
+{"status": "logged out"}
+
+Database Updates:
+- current_login_status set to null
 
 
 5. RETRY LOGIC

@@ -4,6 +4,12 @@ import os
 import sys
 from pathlib import Path
 
+# Local demo machines may have GPUs newer than the installed TensorFlow build.
+# If TensorFlow attempts to JIT unsupported GPU kernels, scoring fails and the
+# auth flow falls back to a zero confidence score. Keep inference on CPU unless
+# a deployment explicitly opts into GPU visibility before importing this module.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import tensorflow as tf
 

@@ -27,7 +27,10 @@ RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "team@cadence-capstone.us")
 
 # CORS for the local dev frontend. Override with CADENCE_CORS_ORIGINS
 # (comma-separated) when deploying behind a different origin.
-_DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:3000,http://127.0.0.1:3000,"
+    "http://localhost:5173,http://127.0.0.1:5173"
+)
 ALLOWED_ORIGINS = {
     origin.strip()
     for origin in os.getenv("CADENCE_CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).split(",")
@@ -276,7 +279,8 @@ def authenticate():
     if not user_id:
         return jsonify({"status": "error", "message": "user profile incomplete - missing user_id"}), 400
     
-    # ensure this is a user who is not logged in and hasn't tried.
+    # Block states that should not start a new authentication attempt.
+    # A real logout clears "logged in" back to null.
     if current_login_status == "pending 2fa":
         return jsonify({"status": "pending 2fa"}), 200
     elif current_login_status == "locked":
@@ -362,6 +366,31 @@ def authenticate():
             enrollment_count,
             "low_confidence",
         )
+
+
+@app.post("/logout")
+def logout():
+    data = request.json or {}
+    username = data.get("username")
+
+    if not username:
+        return jsonify({"status": "error", "message": "missing username"}), 400
+
+    user = supabase.table("user_profiles") \
+        .select("user_id") \
+        .eq("username", username) \
+        .execute()
+
+    if not user.data:
+        return jsonify({"status": "user not found"}), 200
+
+    supabase.table("user_profiles") \
+        .update({"current_login_status": None}) \
+        .eq("username", username) \
+        .execute()
+
+    return jsonify({"status": "logged out"}), 200
+
 
 # main endpoint 2: after code is sent to user's email, client gets one-time code from user. 
 # this method verifies it against the OTP hash that was generated and stored in _2fa challenges table in supabase. 
