@@ -28,6 +28,27 @@ require() {
         || fail "Missing prerequisite: $1.${2:+ $2}"
 }
 
+apply_schema() {
+    if command -v psql >/dev/null 2>&1; then
+        psql "$DB_URL" -v ON_ERROR_STOP=1 -q -f "$SCHEMA_FILE"
+        return
+    fi
+
+    info "psql not found locally; applying schema through the Supabase DB container"
+    DB_CONTAINER="$(
+        docker ps --format '{{.Names}}' \
+            | grep '^supabase_db_' \
+            | head -n 1 \
+            || true
+    )"
+    if [ -z "$DB_CONTAINER" ]; then
+        fail "Could not find a running Supabase database container."
+    fi
+    docker exec -i "$DB_CONTAINER" \
+        psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
+        <"$SCHEMA_FILE"
+}
+
 bold "[1/5] Checking prerequisites"
 require python3 "Install Python 3.11 or 3.12. (3.13 may lack TensorFlow wheels and force a long source build.)"
 PY_VERSION="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
@@ -37,12 +58,21 @@ case "$PY_VERSION" in
 esac
 require docker "Install Docker Desktop or Docker Engine, then make sure the daemon is running."
 docker info >/dev/null 2>&1 || fail "Docker daemon isn't responding. Start Docker and re-run."
-require supabase "Install with: brew install supabase/tap/supabase  (macOS) or see https://supabase.com/docs/guides/cli."
-# `supabase status -o env` was added in CLI v1.x. Bail early if it's
-# missing rather than producing confusing errors later.
-supabase status --help 2>&1 | grep -q -- '-o, --output' \
-    || fail "Your Supabase CLI is too old (need v1.x+ that supports '-o env'). Upgrade it."
-require psql "Install the Postgres client (libpq). On macOS: brew install libpq && brew link --force libpq."
+
+if command -v supabase >/dev/null 2>&1; then
+    SUPABASE=(supabase)
+    SUPABASE_DISPLAY="supabase"
+else
+    require npx "Install Node.js/npm, or install the Supabase CLI globally."
+    SUPABASE=(npx supabase)
+    SUPABASE_DISPLAY="npx supabase"
+    info "Supabase CLI not found globally; using npx supabase"
+fi
+
+# Confirm the CLI supports status env output. Supabase CLI v2 formats
+# help as "--output, -o", while older scripts checked for "-o, --output".
+"${SUPABASE[@]}" status --help 2>&1 | grep -q -- 'env' \
+    || fail "Your Supabase CLI does not appear to support 'status -o env'. Upgrade it."
 ok "tooling looks good (python $PY_VERSION)"
 
 bold "[2/5] Python venv + backend deps"
@@ -59,12 +89,12 @@ cd "$REPO_ROOT"
 if [ ! -f "$REPO_ROOT/supabase/config.toml" ]; then
     # `supabase init` asks about VS Code / IntelliJ settings. Decline both
     # so the script stays non-interactive.
-    printf 'N\nN\n' | supabase init >/dev/null
+    printf 'N\nN\n' | "${SUPABASE[@]}" init >/dev/null
     info "supabase project initialized"
 fi
 # `supabase start` is idempotent — if the stack is already up it just
 # prints status. If you ever want a clean slate: `supabase stop --no-backup`.
-supabase start >/dev/null
+"${SUPABASE[@]}" start >/dev/null
 ok "supabase local stack running"
 
 # Pull connection details. `supabase status -o env` emits shell-friendly
@@ -72,7 +102,7 @@ ok "supabase local stack running"
 # untrusted output.
 STATUS_FILE="$(mktemp)"
 trap 'rm -f "$STATUS_FILE"' EXIT
-supabase status -o env >"$STATUS_FILE"
+"${SUPABASE[@]}" status -o env | grep -E '^[A-Z0-9_]+=' >"$STATUS_FILE"
 # shellcheck disable=SC1090
 source "$STATUS_FILE"
 DB_URL="${DB_URL:?supabase status did not return DB_URL}"
@@ -80,7 +110,7 @@ API_URL="${API_URL:?supabase status did not return API_URL}"
 SERVICE_ROLE_KEY="${SERVICE_ROLE_KEY:?supabase status did not return SERVICE_ROLE_KEY}"
 
 bold "[4/5] Applying schema"
-psql "$DB_URL" -v ON_ERROR_STOP=1 -q -f "$SCHEMA_FILE"
+apply_schema
 ok "schema applied"
 
 bold "[5/5] Writing $ENV_FILE"
@@ -92,10 +122,11 @@ SUPABASE_URL=$API_URL
 SUPABASE_KEY=$SERVICE_ROLE_KEY
 RESEND_KEY=
 CADENCE_DEMO_MODE=1
+CADENCE_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173
 EOF
 ok "wrote $ENV_FILE (demo mode on, resend disabled)"
 
-cat <<'NEXT'
+cat <<NEXT
 
 Setup complete.
 
@@ -106,16 +137,17 @@ To run the stack (two terminals):
   source .venv/bin/activate
   python -c "from app import app; app.run(host='127.0.0.1', port=5001)"
 
-  # frontend (static, port 5173)
+  # frontend (Next.js, port 3000)
   cd frontend
-  python3 -m http.server 5173
+  npm install
+  npm run dev
 
-Then open http://localhost:5173 and try a signup → login → 2FA cycle.
+Then open http://localhost:3000 and try a signup → login → 2FA cycle.
 The OTP is shown in the green "Demo mode" banner on the 2FA page.
 
 Useful commands:
-  supabase status              # local URLs and keys
-  supabase stop                # tear down the docker stack
-  psql "$(supabase status -o env | grep ^DB_URL= | cut -d= -f2-)" \
-       -c 'select count(*) from auth.users;'
+  $SUPABASE_DISPLAY status              # local URLs and keys
+  $SUPABASE_DISPLAY stop                # tear down the docker stack
+  docker exec -it \$(docker ps --format '{{.Names}}' | grep '^supabase_db_' | head -n 1) \\
+       psql -U postgres -d postgres -c 'select count(*) from auth.users;'
 NEXT

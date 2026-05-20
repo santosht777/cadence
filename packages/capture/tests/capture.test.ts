@@ -62,6 +62,10 @@ function collect(cap: ReturnType<typeof createCapture>) {
   return events;
 }
 
+function waitForDeferredBlur(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+
 function lastSample(events: CaptureEvent[]): Sample {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]!;
@@ -367,7 +371,7 @@ describe('createCapture — validation on stop()', () => {
 // ---------------------------------------------------------------------------
 
 describe('createCapture — buffer clearing', () => {
-  it('does not bleed events, flags, untrusted count, or pressed keys between sessions', () => {
+  it('does not bleed events, flags, untrusted count, or pressed keys between sessions', async () => {
     const cap = createCapture({ target: input, mode: 'freetext' });
     const log = collect(cap);
 
@@ -376,6 +380,7 @@ describe('createCapture — buffer clearing', () => {
     dispatchTrusted(input, 'keydown', { code: 'KeyA' });
     dispatchTrusted(input, 'keyup', { code: 'KeyA' });
     input.dispatchEvent(new Event('blur')); // flag
+    await waitForDeferredBlur();
     cap.stop();
 
     const s1 = (log.filter((e) => e.type === 'sample_ready') as Extract<
@@ -400,6 +405,64 @@ describe('createCapture — buffer clearing', () => {
     expect(s2.flags).toEqual([]);
     expect(s2.session_id).not.toEqual(s1.session_id);
 
+    cap.destroy();
+  });
+
+  it('restarts the active capture when Backspace or Delete is pressed', () => {
+    const cap = createCapture({ target: input, mode: 'password' });
+    const log = collect(cap);
+    input.value = 'autofilled-secret';
+    cap.start();
+
+    dispatchTrusted(input, 'keydown', { code: 'KeyA' });
+    dispatchTrusted(input, 'keyup', { code: 'KeyA' });
+    dispatchTrusted(input, 'keydown', { code: 'MetaLeft' });
+    const deleteEvent = dispatchTrusted(input, 'keydown', {
+      code: 'Backspace',
+      cancelable: true
+    });
+    input.dispatchEvent(new Event('input'));
+    input.value = 'refilled-by-password-manager';
+    input.dispatchEvent(new Event('input'));
+    dispatchTrusted(input, 'keyup', { code: 'Backspace' });
+    dispatchTrusted(input, 'keyup', { code: 'MetaLeft' });
+    dispatchTrusted(input, 'keydown', { code: 'KeyB' });
+    dispatchTrusted(input, 'keyup', { code: 'KeyB' });
+
+    cap.stop();
+
+    const sample = lastSample(log);
+    expect(sample.events.map((e) => `${e.type}:${e.code}`)).toEqual([
+      'down:KeyB',
+      'up:KeyB'
+    ]);
+    expect(sample.flags).not.toContain('autofill_suspected');
+    expect(deleteEvent.defaultPrevented).toBe(true);
+    expect(input.value).toBe('');
+    cap.destroy();
+  });
+
+  it('lets deletion restart recover from a poisoned autofill session', () => {
+    const cap = createCapture({ target: input, mode: 'password' });
+    const log = collect(cap);
+    cap.start();
+
+    input.dispatchEvent(new Event('input'));
+    dispatchTrusted(input, 'keydown', { code: 'Backspace' });
+    input.dispatchEvent(new Event('input'));
+    dispatchTrusted(input, 'keyup', { code: 'Backspace' });
+    dispatchTrusted(input, 'keydown', { code: 'KeyA' });
+    dispatchTrusted(input, 'keyup', { code: 'KeyA' });
+
+    cap.stop();
+
+    const sample = lastSample(log);
+    expect(sample.events.map((e) => `${e.type}:${e.code}`)).toEqual([
+      'down:KeyA',
+      'up:KeyA'
+    ]);
+    expect(sample.flags).toEqual([]);
+    expect(log).not.toContainEqual({ type: 'sample_rejected', reason: 'poisoned' });
     cap.destroy();
   });
 });
@@ -678,12 +741,13 @@ describe('contamination — paste', () => {
 });
 
 describe('contamination — focus loss', () => {
-  it('blur on target raises focus_lost', () => {
+  it('blur on target raises focus_lost', async () => {
     const cap = createCapture({ target: input, mode: 'freetext' });
     const log = collect(cap);
     cap.start();
     typeOneKey(input);
     input.dispatchEvent(new Event('blur'));
+    await waitForDeferredBlur();
     cap.stop();
     expect(lastSample(log).flags).toContain('focus_lost');
     cap.destroy();
@@ -713,14 +777,26 @@ describe('contamination — focus loss', () => {
     cap.destroy();
   });
 
-  it('blur rejects in password mode', () => {
+  it('blur does not reject password mode after focus remains away', async () => {
+    const cap = createCapture({ target: input, mode: 'password' });
+    const log = collect(cap);
+    cap.start();
+    typeOneKey(input);
+    input.dispatchEvent(new Event('blur'));
+    await waitForDeferredBlur();
+    cap.stop();
+    expect(lastSample(log).flags).not.toContain('focus_lost');
+    cap.destroy();
+  });
+
+  it('blur immediately followed by stop does not poison submit clicks', () => {
     const cap = createCapture({ target: input, mode: 'password' });
     const log = collect(cap);
     cap.start();
     typeOneKey(input);
     input.dispatchEvent(new Event('blur'));
     cap.stop();
-    expect(log).toContainEqual({ type: 'sample_rejected', reason: 'poisoned' });
+    expect(lastSample(log).flags).not.toContain('focus_lost');
     cap.destroy();
   });
 });
@@ -860,24 +936,26 @@ describe('contamination — mode behavior', () => {
     cap.destroy();
   });
 
-  it('username mode rejects on any flag (Phase 3: same as password)', () => {
+  it('username mode ignores blur like password mode', async () => {
     const cap = createCapture({ target: input, mode: 'username' });
     const log = collect(cap);
     cap.start();
     typeOneKey(input);
     input.dispatchEvent(new Event('blur'));
+    await waitForDeferredBlur();
     cap.stop();
-    expect(log).toContainEqual({ type: 'sample_rejected', reason: 'poisoned' });
+    expect(lastSample(log).flags).not.toContain('focus_lost');
     cap.destroy();
   });
 
-  it('freetext mode emits sample_ready with flags recorded', () => {
+  it('freetext mode emits sample_ready with flags recorded', async () => {
     const cap = createCapture({ target: input, mode: 'freetext' });
     const log = collect(cap);
     cap.start();
     typeOneKey(input);
     input.dispatchEvent(new Event('paste'));
     input.dispatchEvent(new Event('blur'));
+    await waitForDeferredBlur();
     cap.stop();
     const s = lastSample(log);
     expect(s.flags.sort()).toEqual(['focus_lost', 'paste_detected']);
@@ -886,7 +964,7 @@ describe('contamination — mode behavior', () => {
 });
 
 describe('contamination — flag idempotency', () => {
-  it('multiple blur events record focus_lost exactly once', () => {
+  it('multiple blur events record focus_lost exactly once', async () => {
     const cap = createCapture({ target: input, mode: 'freetext' });
     const log = collect(cap);
     cap.start();
@@ -894,6 +972,7 @@ describe('contamination — flag idempotency', () => {
     input.dispatchEvent(new Event('blur'));
     input.dispatchEvent(new Event('blur'));
     input.dispatchEvent(new Event('blur'));
+    await waitForDeferredBlur();
     cap.stop();
     const s = lastSample(log);
     expect(s.flags.filter((f) => f === 'focus_lost')).toHaveLength(1);

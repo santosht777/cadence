@@ -70,6 +70,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     'Welcome back. The paradigm has been shifted on your behalf.'
   );
   const [enrollment, setEnrollment] = useState(null);
+  const [activeUsername, setActiveUsername] = useState(null);
 
   const registerEmailRef = useRef(null);
   const registerUsernameRef = useRef(null);
@@ -101,6 +102,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     if (!input) return;
 
     let lastSample = null;
+    let lastRejection = null;
     const session = createCapture({
       target: input,
       mode: 'password',
@@ -111,13 +113,17 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     });
 
     session.on('error', (ev) => console.warn('[cadence]', ev.error));
+    session.on('sample_rejected', (ev) => {
+      lastRejection = ev.reason;
+    });
     session.start();
     activeCaptureRef.current = {
       session,
       finalize() {
         lastSample = null;
+        lastRejection = null;
         session.stop();
-        return lastSample;
+        return { sample: lastSample, rejection: lastRejection };
       }
     };
   }, [teardownCapture]);
@@ -159,9 +165,10 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     return { ok: res.ok, status: res.status, json };
   }, []);
 
-  const goToDashboard = useCallback((message, payload) => {
+  const goToDashboard = useCallback((message, payload, username = null) => {
     if (message) setDashboardSub(message);
     setEnrollment(payload);
+    setActiveUsername(username);
     showView('dashboard');
   }, [showView]);
 
@@ -229,7 +236,20 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       return;
     }
 
-    const sample = activeCaptureRef.current ? activeCaptureRef.current.finalize() : null;
+    const capture = activeCaptureRef.current
+      ? activeCaptureRef.current.finalize()
+      : { sample: null, rejection: 'session_not_started' };
+    const sample = capture.sample;
+    if (!sample || sample.events.length === 0) {
+      const message =
+        capture.rejection === 'poisoned'
+          ? 'Clear the password field and type it manually before signing in.'
+          : 'Type your password manually before signing in.';
+      if (loginPasswordRef.current) loginPasswordRef.current.value = '';
+      setStatus('login', message, 'error');
+      attachCapture(loginPasswordRef.current);
+      return;
+    }
     const raw_data = sample ? { events: sample.events } : { events: [] };
 
     setStatus('login', 'Analyzing your typing rhythm...');
@@ -238,7 +258,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
 
       switch (json.status) {
         case 'accepted':
-          goToDashboard('Welcome back. The paradigm is yours.', json);
+          goToDashboard('Welcome back. The paradigm is yours.', json, username);
           return;
         case '2fa required': {
           pendingAuthRef.current = {
@@ -258,7 +278,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
           setStatus('login', 'A previous login is still pending verification.', 'error');
           return;
         case 'logged in':
-          goToDashboard('Already signed in elsewhere. Carry on.', null);
+          goToDashboard('Already signed in elsewhere. Carry on.', null, username);
           return;
         case 'account is locked':
           setStatus(
@@ -303,11 +323,12 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       });
 
       if (json.status === 'accepted') {
+        const verifiedUsername = pendingAuth.username;
         pendingAuthRef.current = { username: null, loginAttemptId: null };
         const message = json.enrolled
           ? 'Verified. You are now fully enrolled.'
           : 'Verified. Keep going - every clean login enrolls another sample.';
-        goToDashboard(message, json);
+        goToDashboard(message, json, verifiedUsername);
         return;
       }
       if (json.message === 'max attempts exceeded') {
@@ -353,8 +374,20 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    const username = activeUsername;
     pendingAuthRef.current = { username: null, loginAttemptId: null };
+    setActiveUsername(null);
+    setEnrollment(null);
+
+    if (username) {
+      try {
+        await api('/logout', { username });
+      } catch (err) {
+        console.warn('[cadence] logout failed', err);
+      }
+    }
+
     showView('landing');
   };
 
@@ -558,6 +591,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   name="email"
                   id="register-email"
                   placeholder="ceo@your-startup.ai"
+                  autoComplete="off"
                   required
                   ref={registerEmailRef}
                 />
@@ -570,6 +604,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   name="username"
                   id="register-username"
                   placeholder="thought.leader.42"
+                  autoComplete="username"
                   required
                   ref={registerUsernameRef}
                 />
@@ -582,6 +617,9 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   name="password"
                   id="register-password"
                   placeholder="••••••••••••"
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                   required
                   ref={registerPasswordRef}
                 />
@@ -630,6 +668,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   name="username"
                   id="login-username"
                   placeholder="thought.leader.42"
+                  autoComplete="username"
                   required
                   ref={loginUsernameRef}
                 />
@@ -642,6 +681,9 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   name="password"
                   id="login-password"
                   placeholder="••••••••••••"
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                   required
                   ref={loginPasswordRef}
                 />
@@ -700,6 +742,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   name="code"
                   id="twofa-code"
                   placeholder="123456"
+                  autoComplete="off"
                   required
                   ref={twofaCodeRef}
                 />
