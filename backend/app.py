@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
+import statistics
 
 load_dotenv()
 
@@ -338,6 +339,7 @@ def authenticate():
     username = data.get("username")
     password = data.get("password")
     raw_data = data.get("raw_data")
+    is_mobile = bool(data.get("is_mobile"))
 
     # basic error handling 
     if not username:
@@ -355,6 +357,12 @@ def authenticate():
         raw_data = _decrypt_events(raw_data)
     except Exception:
         return jsonify({"status": "error", "message": "invalid keystroke payload"}), 400
+
+    # Reject suspiciously uniform or impossibly fast keystroke sequences.
+    # Matches the same message as the paste check so automated tooling gets
+    # no signal about which specific heuristic was triggered.
+    if _is_scripted_typing(raw_data):
+        return jsonify({"status": "error", "message": "please type your password manually"}), 400
 
     # query user_profiles table to check user exists and get email for Supabase auth
     user = supabase.table("user_profiles") \
@@ -435,6 +443,17 @@ def authenticate():
             login_attempt_id,
             enrollment_count,
             "enrollment_required",
+        )
+
+    # Biometric model is trained on desktop typing — skip scoring on mobile
+    # and require 2FA directly so the user isn't falsely rejected.
+    if is_mobile:
+        return require_2fa(
+            user_id,
+            username,
+            login_attempt_id,
+            enrollment_count,
+            "mobile_device",
         )
 
     # get the score from ML engine 
@@ -742,6 +761,37 @@ def _handle_failed_password(user_id, username, current_failures):
         "login_attempt_id": unlock_attempt_id,
         "demo_otp": otp if DEMO_MODE else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Scripted-typing detection
+# ---------------------------------------------------------------------------
+
+# Thresholds derived from human typing research and the specific 10ms-apart
+# script the team observed. Configurable via env so they can be tuned without
+# a redeploy if legitimate users with unusual typing styles are affected.
+_MIN_MEAN_INTERVAL_MS  = float(os.getenv("CADENCE_MIN_MEAN_INTERVAL_MS",  "30"))
+_MIN_STDDEV_INTERVAL_MS = float(os.getenv("CADENCE_MIN_STDDEV_INTERVAL_MS", "8"))
+
+def _is_scripted_typing(raw_data):
+    # Extract timestamps of keydown events only (down-to-down intervals are
+    # the standard measure of typing speed and rhythm).
+    events = (raw_data or {}).get("events") or []
+    down_times = [e["t"] for e in events if e.get("type") == "down"]
+
+    # Need at least 3 intervals to compute a meaningful standard deviation.
+    if len(down_times) < 4:
+        return False
+
+    intervals = [down_times[i] - down_times[i - 1] for i in range(1, len(down_times))]
+
+    mean_ms   = statistics.mean(intervals)
+    stddev_ms = statistics.pstdev(intervals)  # population stdev — no sampling assumption
+
+    # A real human cannot sustain sub-30ms intervals, and no human produces
+    # near-zero variance across all keystrokes. Either condition alone is
+    # sufficient to flag the session as automated.
+    return mean_ms < _MIN_MEAN_INTERVAL_MS or stddev_ms < _MIN_STDDEV_INTERVAL_MS
 
 
 # ---------------------------------------------------------------------------

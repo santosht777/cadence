@@ -24,6 +24,16 @@ function getApiBase() {
   );
 }
 
+// Detect mobile/touch devices so the backend can skip biometric scoring
+// (trained on desktop typing) and fall straight through to 2FA instead.
+// Combines two independent signals — touch capability and coarse pointer
+// (touchscreen) — which together are reliable without reading user-agent strings.
+function isMobileDevice() {
+  if (typeof window === 'undefined') return false;
+  return navigator.maxTouchPoints > 0 &&
+         window.matchMedia('(pointer: coarse)').matches;
+}
+
 // Hash the password client-side before it ever leaves the browser.
 // This means a shoulder surfer watching the Network tab or a leaked request
 // log never sees the plaintext password. The hash is what Supabase stores
@@ -342,10 +352,11 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       return;
     }
     const raw_data = await encryptEvents(events, rsaPublicKeyRef.current);
+    const is_mobile = isMobileDevice();
 
     setStatus('login', 'Analyzing your typing rhythm...');
     try {
-      const { json } = await api('/authenticate', { username, password: hashedPassword, raw_data });
+      const { json } = await api('/authenticate', { username, password: hashedPassword, raw_data, is_mobile });
 
       switch (json.status) {
         case 'accepted':
@@ -360,6 +371,8 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
           const reasonNote =
             json.reason === 'enrollment_required'
               ? `Enrollment in progress (${json.enrollment_count}/${json.enrollment_required}). Check your email for a code.`
+              : json.reason === 'mobile_device'
+              ? 'Mobile sign-in detected — check your email for a verification code.'
               : 'Your typing rhythm looked off. Check your email for a code.';
           setStatus('login', reasonNote, 'success');
           window.setTimeout(() => showView('twofa'), 600);
