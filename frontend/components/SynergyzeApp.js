@@ -242,7 +242,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     // it at runtime. The public key is safe to embed — only the private key
     // (kept on the server) can decrypt. Set NEXT_PUBLIC_RSA_PUBLIC_KEY in the
     // frontend Vercel project to the PEM value from the backend /public-key endpoint.
-    const pem = process.env.NEXT_PUBLIC_RSA_PUBLIC_KEY;
+    const pem = process.env.NEXT_PUBLIC_RSA_KEY;
     if (!pem) return;
     crypto.subtle.importKey(
       'spki', pemToBuffer(pem),
