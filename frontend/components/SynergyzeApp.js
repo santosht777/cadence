@@ -288,6 +288,22 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       setStatus('register', 'Password must be at least 8 characters.', 'error');
       return;
     }
+    if (!/[A-Z]/.test(password)) {
+      setStatus('register', 'Password must contain at least one uppercase letter.', 'error');
+      return;
+    }
+    if (!/[a-z]/.test(password)) {
+      setStatus('register', 'Password must contain at least one lowercase letter.', 'error');
+      return;
+    }
+    if (!/[0-9]/.test(password)) {
+      setStatus('register', 'Password must contain at least one number.', 'error');
+      return;
+    }
+    if (!/[^A-Za-z0-9]/.test(password)) {
+      setStatus('register', 'Password must contain at least one special character.', 'error');
+      return;
+    }
     if (password.toLowerCase().includes(username.toLowerCase())) {
       setStatus('register', 'Password must not contain your username.', 'error');
       return;
@@ -746,10 +762,14 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   required
                   ref={registerPasswordRef}
                 />
-                <span className="field-hint">
-                  Minimum 8 characters. Type naturally - Cadence will use your keystroke rhythm as a
-                  second factor on sign in.
-                </span>
+                <ul className="field-hint">
+                  <li>At least 8 characters</li>
+                  <li>One uppercase letter (A–Z)</li>
+                  <li>One lowercase letter (a–z)</li>
+                  <li>One number (0–9)</li>
+                  <li>One special character (!@#$…)</li>
+                  <li>Type naturally — Cadence uses your keystroke rhythm as a second factor</li>
+                </ul>
               </label>
 
               <button type="submit" className="btn btn-primary btn-block">
