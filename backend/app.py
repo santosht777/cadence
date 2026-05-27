@@ -5,8 +5,12 @@ import random
 import hashlib
 import json
 import base64
+import hmac
+import re
 import resend
 from datetime import datetime, timedelta, timezone
+from functools import wraps
+import secrets
 import uuid
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -91,6 +95,8 @@ def cors_preflight(_any=None):
 REQUIRED_ENROLLMENT_SAMPLES = int(
     os.getenv("CADENCE_REQUIRED_ENROLLMENT_SAMPLES", "5")
 )
+ADMIN_TOKEN = os.getenv("CADENCE_ADMIN_TOKEN")
+API_KEY_PREFIX_LENGTH = 18
 
 # Two clients on purpose:
 #   `supabase`      → service-role, used for ALL table reads/writes.
@@ -148,6 +154,142 @@ def _supabase_sign_in(email, password):
         return auth.sign_in_with_password({"email": email, "password": password})
     except TypeError:
         return auth.sign_in(email=email, password=password)
+
+
+def error_response(message, status=400, code="error"):
+    return jsonify({"status": code, "message": message}), status
+
+
+def slugify(value):
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+    return slug or f"app-{secrets.token_hex(4)}"
+
+
+def hash_api_key(api_key):
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def generate_api_key():
+    return f"sk_live_{secrets.token_urlsafe(32)}"
+
+
+def require_admin_if_configured():
+    if not ADMIN_TOKEN:
+        return None
+    provided = request.headers.get("X-Cadence-Admin-Token", "")
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        provided = auth.split(" ", 1)[1].strip()
+    if hmac.compare_digest(provided, ADMIN_TOKEN):
+        return None
+    return error_response("missing or invalid admin token", 401, "unauthorized")
+
+
+def require_api_key(handler):
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.lower().startswith("bearer "):
+            return error_response("missing bearer API key", 401, "unauthorized")
+
+        api_key = auth.split(" ", 1)[1].strip()
+        if not api_key:
+            return error_response("missing bearer API key", 401, "unauthorized")
+
+        prefix = api_key[:API_KEY_PREFIX_LENGTH]
+        result = supabase.table("api_keys") \
+            .select("api_key_id, application_id, key_prefix, key_hash, revoked_at") \
+            .eq("key_prefix", prefix) \
+            .execute()
+        rows = result.data or []
+        key_row = rows[0] if rows else None
+        if (
+            not key_row
+            or key_row.get("revoked_at") is not None
+            or not hmac.compare_digest(key_row.get("key_hash", ""), hash_api_key(api_key))
+        ):
+            return error_response("invalid API key", 401, "unauthorized")
+
+        app_result = supabase.table("applications") \
+            .select("*") \
+            .eq("application_id", key_row["application_id"]) \
+            .execute()
+        app_rows = app_result.data or []
+        if not app_rows:
+            return error_response("API key application not found", 401, "unauthorized")
+
+        supabase.table("api_keys") \
+            .update({"last_used_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("api_key_id", key_row["api_key_id"]) \
+            .execute()
+        request.cadence_api_key = key_row
+        request.cadence_application = app_rows[0]
+        return handler(*args, **kwargs)
+
+    return wrapped
+
+
+def get_json_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def get_or_create_end_user(application_id, external_user_id, threshold=None, metadata=None):
+    query = supabase.table("end_users") \
+        .select("*") \
+        .eq("application_id", application_id) \
+        .eq("external_user_id", external_user_id) \
+        .execute()
+    rows = query.data or []
+    if rows:
+        return rows[0]
+
+    payload = {
+        "application_id": application_id,
+        "external_user_id": external_user_id,
+        "metadata": metadata or {},
+    }
+    if threshold is not None:
+        payload["threshold"] = float(threshold)
+
+    created = supabase.table("end_users").insert(payload).execute()
+    return (created.data or [None])[0]
+
+
+def count_platform_enrollment(end_user_id):
+    result = supabase.table("typing_samples") \
+        .select("typing_sample_id") \
+        .eq("end_user_id", end_user_id) \
+        .eq("successful", True) \
+        .execute()
+    return len(result.data or [])
+
+
+def platform_enrollment_payload(end_user_id):
+    enrollment_count = count_platform_enrollment(end_user_id)
+    samples_needed = max(REQUIRED_ENROLLMENT_SAMPLES - enrollment_count, 0)
+    return {
+        "enrolled": samples_needed == 0,
+        "enrollment_count": enrollment_count,
+        "enrollment_required": REQUIRED_ENROLLMENT_SAMPLES,
+        "enrollment_samples_needed": samples_needed,
+    }
+
+
+def fetch_platform_enrollment_samples(end_user_id):
+    result = supabase.table("typing_samples") \
+        .select("raw_data") \
+        .eq("end_user_id", end_user_id) \
+        .eq("successful", True) \
+        .order("created_at", desc=True) \
+        .limit(model_service.enrollment_limit) \
+        .execute()
+    samples = []
+    for row in result.data or []:
+        raw_data = row.get("raw_data")
+        if raw_data:
+            samples.append(model_service.raw_data_to_sample(raw_data))
+    return samples
 
 
 def count_successful_login_attempts(user_id):
@@ -249,6 +391,226 @@ def _decrypt_events(raw_data):
     )
     plaintext = AESGCM(aes_key).decrypt(iv, ct, None)
     return json.loads(plaintext)
+
+
+@app.post("/v1/apps")
+def create_platform_app():
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    data = get_json_body()
+    name = (data.get("name") or "").strip()
+    if not name:
+        return error_response("missing name")
+
+    allowed_origins = data.get("allowed_origins") or []
+    if not isinstance(allowed_origins, list) or not all(
+        isinstance(origin, str) for origin in allowed_origins
+    ):
+        return error_response("allowed_origins must be a list of strings")
+
+    payload = {
+        "name": name,
+        "slug": slugify(data.get("slug") or name),
+        "allowed_origins": allowed_origins,
+    }
+    try:
+        result = supabase.table("applications").insert(payload).execute()
+    except Exception as exc:
+        return error_response(str(exc), 400)
+
+    return jsonify({"status": "created", "application": result.data[0]}), 201
+
+
+@app.post("/v1/apps/<application_id>/api-keys")
+def create_platform_api_key(application_id):
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    app_result = supabase.table("applications") \
+        .select("application_id") \
+        .eq("application_id", application_id) \
+        .execute()
+    if not (app_result.data or []):
+        return error_response("application not found", 404, "not_found")
+
+    data = get_json_body()
+    api_key = generate_api_key()
+    payload = {
+        "application_id": application_id,
+        "name": (data.get("name") or "default").strip() or "default",
+        "key_prefix": api_key[:API_KEY_PREFIX_LENGTH],
+        "key_hash": hash_api_key(api_key),
+    }
+    result = supabase.table("api_keys").insert(payload).execute()
+    key_row = result.data[0]
+    return jsonify({
+        "status": "created",
+        "api_key": {
+            "api_key_id": key_row["api_key_id"],
+            "application_id": key_row["application_id"],
+            "name": key_row["name"],
+            "key_prefix": key_row["key_prefix"],
+            "key": api_key,
+        },
+    }), 201
+
+
+@app.post("/v1/end-users")
+@require_api_key
+def create_platform_end_user():
+    data = get_json_body()
+    external_user_id = (data.get("external_user_id") or "").strip()
+    if not external_user_id:
+        return error_response("missing external_user_id")
+
+    metadata = data.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return error_response("metadata must be an object")
+
+    end_user = get_or_create_end_user(
+        request.cadence_application["application_id"],
+        external_user_id,
+        threshold=data.get("threshold"),
+        metadata=metadata,
+    )
+    return jsonify({
+        "status": "ok",
+        "end_user": end_user,
+        **platform_enrollment_payload(end_user["end_user_id"]),
+    })
+
+
+@app.get("/v1/end-users/<external_user_id>")
+@require_api_key
+def get_platform_end_user(external_user_id):
+    result = supabase.table("end_users") \
+        .select("*") \
+        .eq("application_id", request.cadence_application["application_id"]) \
+        .eq("external_user_id", external_user_id) \
+        .execute()
+    rows = result.data or []
+    if not rows:
+        return error_response("end user not found", 404, "not_found")
+
+    end_user = rows[0]
+    return jsonify({
+        "status": "ok",
+        "end_user": end_user,
+        **platform_enrollment_payload(end_user["end_user_id"]),
+    })
+
+
+@app.post("/v1/enroll")
+@require_api_key
+def platform_enroll():
+    data = get_json_body()
+    external_user_id = (data.get("external_user_id") or "").strip()
+    raw_data = data.get("raw_data")
+    if not external_user_id:
+        return error_response("missing external_user_id")
+    if raw_data is None:
+        return error_response("missing raw_data")
+
+    try:
+        model_service.raw_data_to_sample(raw_data)
+    except Exception as exc:
+        return error_response(f"invalid raw_data: {exc}")
+
+    app_id = request.cadence_application["application_id"]
+    end_user = get_or_create_end_user(app_id, external_user_id)
+    flags = data.get("flags") or []
+    if not isinstance(flags, list) or not all(isinstance(flag, str) for flag in flags):
+        return error_response("flags must be a list of strings")
+
+    payload = {
+        "application_id": app_id,
+        "end_user_id": end_user["end_user_id"],
+        "raw_data": raw_data,
+        "source": data.get("source") or "enrollment",
+        "successful": bool(data.get("successful", True)),
+        "quality_score": data.get("quality_score"),
+        "flags": flags,
+    }
+    supabase.table("typing_samples").insert(payload).execute()
+    return jsonify({
+        "status": "enrolled",
+        "end_user_id": end_user["end_user_id"],
+        "external_user_id": external_user_id,
+        **platform_enrollment_payload(end_user["end_user_id"]),
+    }), 201
+
+
+@app.post("/v1/score")
+@require_api_key
+def platform_score():
+    data = get_json_body()
+    external_user_id = (data.get("external_user_id") or "").strip()
+    raw_data = data.get("raw_data")
+    if not external_user_id:
+        return error_response("missing external_user_id")
+    if raw_data is None:
+        return error_response("missing raw_data")
+
+    app_id = request.cadence_application["application_id"]
+    end_user = get_or_create_end_user(app_id, external_user_id)
+    enrollment = platform_enrollment_payload(end_user["end_user_id"])
+    threshold = float(data.get("threshold") or end_user.get("threshold") or 0.5)
+
+    score = None
+    accepted = False
+    reason = None
+    if not enrollment["enrolled"]:
+        reason = "not_enrolled"
+    else:
+        try:
+            current_sample = model_service.raw_data_to_sample(raw_data)
+            enrollment_samples = fetch_platform_enrollment_samples(end_user["end_user_id"])
+            score = model_service.score_against_enrollment(current_sample, enrollment_samples)
+            accepted = score >= threshold
+            reason = "accepted" if accepted else "low_confidence"
+        except Exception as exc:
+            app.logger.exception("platform model scoring failed")
+            reason = f"scoring_failed: {exc}"
+
+    request_payload = {
+        "application_id": app_id,
+        "end_user_id": end_user["end_user_id"],
+        "external_user_id": external_user_id,
+        "raw_data": raw_data,
+        "score": score,
+        "threshold": threshold,
+        "accepted": accepted,
+        "enrolled": enrollment["enrolled"],
+        "enrollment_count": enrollment["enrollment_count"],
+        "enrollment_required": enrollment["enrollment_required"],
+        "reason": reason,
+    }
+    score_result = supabase.table("score_requests").insert(request_payload).execute()
+
+    if accepted and data.get("store_successful_sample", False):
+        supabase.table("typing_samples").insert({
+            "application_id": app_id,
+            "end_user_id": end_user["end_user_id"],
+            "raw_data": raw_data,
+            "source": "score",
+            "successful": True,
+            "confidence_score": score,
+        }).execute()
+
+    return jsonify({
+        "status": "ok",
+        "score_request_id": score_result.data[0]["score_request_id"],
+        "end_user_id": end_user["end_user_id"],
+        "external_user_id": external_user_id,
+        "score": score,
+        "accepted": accepted,
+        "threshold": threshold,
+        "reason": reason,
+        **enrollment,
+    })
 
 
 # user signup endpoint
