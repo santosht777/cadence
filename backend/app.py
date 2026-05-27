@@ -3,9 +3,17 @@ from dotenv import load_dotenv
 import os
 import random
 import hashlib
+import json
+import base64
 import resend
 from datetime import datetime, timedelta, timezone
 import uuid
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes, serialization
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv()
 
@@ -17,7 +25,32 @@ except ImportError:
     from model_service import CadenceModelService
 
 app = Flask(__name__)
+# Trust one level of X-Forwarded-For so the rate limiter sees the real
+# client IP rather than the hosting platform's proxy address.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 model_service = CadenceModelService()
+
+# ---------------------------------------------------------------------------
+# Rate limiting — applied per originating IP.
+# /authenticate is the sensitive endpoint; limits are intentionally strict.
+# Uses in-memory storage (fine for single-instance / demo). Swap storage_uri
+# to "redis://..." for a multi-instance production deployment.
+# ---------------------------------------------------------------------------
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri="memory://",
+    default_limits=[],
+)
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({"status": "error", "message": "too many attempts — slow down and try again"}), 429
+
+
+# How many consecutive wrong passwords before we lock the account and send
+# an unlock email. Configurable via env so it can be tuned without a deploy.
+FAILED_PASSWORD_THRESHOLD = int(os.getenv("CADENCE_PASSWORD_ATTEMPT_THRESHOLD", "5"))
 
 # Demo mode: skips the Resend email and returns the freshly-generated
 # OTP in the API response so testers without access to the inbox can
@@ -71,6 +104,28 @@ SUPABASE_URL = os.getenv("SUPABASE_URL").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY").strip()
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase_auth = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ---------------------------------------------------------------------------
+# RSA keypair for encrypting keystroke events in transit.
+# In production, set CADENCE_RSA_PRIVATE_KEY to a PEM-encoded private key so
+# the same key survives restarts and can be rotated deliberately. In dev/demo
+# mode a fresh ephemeral key is generated at startup — perfectly fine because
+# the frontend fetches the public key fresh on every page load.
+# ---------------------------------------------------------------------------
+_raw_pem = os.getenv("CADENCE_RSA_PRIVATE_KEY")
+if _raw_pem:
+    _RSA_PRIVATE_KEY = serialization.load_pem_private_key(
+        _raw_pem.strip().encode(), password=None
+    )
+else:
+    _RSA_PRIVATE_KEY = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+
+_RSA_PUBLIC_KEY_PEM = _RSA_PRIVATE_KEY.public_key().public_bytes(
+    serialization.Encoding.PEM,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+).decode()
 
 
 def _supabase_sign_up(email, password):
@@ -155,7 +210,7 @@ def require_2fa(user_id, username, login_attempt_id, enrollment_count, reason):
     return jsonify(body), 200
 
 
-# health check endpoint 
+# health check endpoint
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -164,6 +219,35 @@ def health():
 @app.get("/model/health")
 def model_health():
     return jsonify(model_service.health())
+
+@app.get("/public-key")
+def public_key():
+    # Vends the RSA public key so the frontend can encrypt keystroke events
+    # before they leave the browser. The private key never leaves the server,
+    # so a dev-tools observer only ever sees ciphertext — no raw timing values
+    # to copy or tweak by a millisecond.
+    return jsonify({"public_key": _RSA_PUBLIC_KEY_PEM}), 200
+
+
+def _decrypt_events(raw_data):
+    # Expects raw_data = { encrypted_key, iv, ciphertext } (all base64).
+    # 1. Unwrap the per-request AES key with our RSA private key (OAEP-SHA256).
+    # 2. Decrypt the events JSON with AES-256-GCM.
+    # Returns the plaintext { events: [...] } dict, or raises on any failure.
+    enc_key = base64.b64decode(raw_data["encrypted_key"])
+    iv      = base64.b64decode(raw_data["iv"])
+    ct      = base64.b64decode(raw_data["ciphertext"])
+
+    aes_key = _RSA_PRIVATE_KEY.decrypt(
+        enc_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    plaintext = AESGCM(aes_key).decrypt(iv, ct, None)
+    return json.loads(plaintext)
 
 
 # user signup endpoint
@@ -175,14 +259,18 @@ def signup():
     password = data.get("password")
     username = data.get("username")
 
-    # error handling 
+    # error handling
     if not email:
         return jsonify({"status": "error", "message": "missing email"}), 400
     if not password:
         return jsonify({"status": "error", "message": "missing password"}), 400
+    if len(password) < 8:
+        return jsonify({"status": "error", "message": "password must be at least 8 characters"}), 400
     if not username:
         return jsonify({"status": "error", "message": "missing username"}), 400
-    
+    if username.lower() in password.lower():
+        return jsonify({"status": "error", "message": "password must not contain your username"}), 400
+
     # check if username already exists
     existing_user = supabase.table("user_profiles") \
         .select("username") \
@@ -244,6 +332,7 @@ def signup():
 # This endpoint authenticates user credentials through Supabase first,
 # then applies biometric scoring and optional 2FA if the score is too low.
 @app.post("/authenticate")
+@limiter.limit("10 per minute; 50 per hour")
 def authenticate():
     data = request.json
     username = data.get("username")
@@ -259,6 +348,13 @@ def authenticate():
 
     if raw_data is None:
         return jsonify({"status": "error", "message": "missing raw_data"}), 400
+
+    # Decrypt the keystroke payload. The frontend always sends an encrypted
+    # envelope; if decryption fails the payload was tampered with or malformed.
+    try:
+        raw_data = _decrypt_events(raw_data)
+    except Exception:
+        return jsonify({"status": "error", "message": "invalid keystroke payload"}), 400
 
     # query user_profiles table to check user exists and get email for Supabase auth
     user = supabase.table("user_profiles") \
@@ -285,6 +381,10 @@ def authenticate():
         return jsonify({"status": "pending 2fa"}), 200
     elif current_login_status == "locked":
         return jsonify({"status": "account is locked"}), 200
+    elif current_login_status == "password_locked":
+        # Account is locked due to too many wrong passwords. The unlock code
+        # was already sent when the threshold was hit; just tell the client.
+        return jsonify({"status": "password_locked"}), 200
     elif current_login_status == "logged in":
         return jsonify({"status": "logged in"}), 200
 
@@ -302,11 +402,29 @@ def authenticate():
         sign_in_error = getattr(sign_in_result, "error", None)
 
     if sign_in_error:
+        # Wrong password: increment the failure counter and, if the threshold
+        # is reached, lock the account and email an unlock code to the owner.
+        lock_info = _handle_failed_password(
+            user_id, username,
+            user_profile.get("failed_password_attempts", 0),
+        )
+        if lock_info:
+            body = {"status": "password_locked", "login_attempt_id": lock_info["login_attempt_id"]}
+            if DEMO_MODE and lock_info.get("demo_otp"):
+                body["demo_otp"] = lock_info["demo_otp"]
+            return jsonify(body), 200
         return jsonify({"status": "error", "message": "invalid credentials"}), 401
 
-    # create new login attempt w user info 
+    # Reject replayed keystroke payloads. We compute the hash after cred
+    # verification intentionally — returning this error to an unauthenticated
+    # caller would confirm that a given username has prior login attempts.
+    events_hash = _hash_events(raw_data)
+    if events_hash and _is_replayed_payload(user_id, events_hash):
+        return jsonify({"status": "error", "message": "duplicate keystroke payload — please retype your password"}), 400
+
+    # create new login attempt w user info
     enrollment_count = count_successful_login_attempts(user_id)
-    login_attempt_id = create_login_attempt(supabase, user_id, username, raw_data)
+    login_attempt_id = create_login_attempt(supabase, user_id, username, raw_data, events_hash=events_hash)
     if login_attempt_id == None:
         return jsonify({"status": "can't verify login"}), 200
 
@@ -348,9 +466,9 @@ def authenticate():
             .eq("login_attempt_id", login_attempt_id) \
             .execute()
 
-        # mark as logged in
+        # mark as logged in and clear any lingering failure counter
         supabase.table("user_profiles") \
-            .update({"current_login_status": "logged in"}) \
+            .update({"current_login_status": "logged in", "failed_password_attempts": 0}) \
             .eq("user_id", user_id) \
             .execute()
             
@@ -468,24 +586,44 @@ def code_verification():
         if now > expires_at:
             return jsonify({"status": "rejected", "message": "expired"}), 200
 
-    # delete the login attempt from 2fa table so code isn't reusable 
+    # delete the login attempt from 2fa table so code isn't reusable
     supabase.table("_2fa").delete().eq("login_attempt_id", login_attempt_id).execute()
 
-    # mark the login attempt as successful 
+    # Check if this verification is unlocking a brute-forced account rather
+    # than completing a normal 2FA login. In the unlock flow the original
+    # password was never correct, so we must not log the user in or count
+    # this as an enrollment sample — we just clear the lock and let them
+    # try again with their real password.
+    profile_result = supabase.table("user_profiles") \
+        .select("current_login_status") \
+        .eq("user_id", user_id) \
+        .single() \
+        .execute()
+    is_unlock = (profile_result.data or {}).get("current_login_status") == "password_locked"
+
+    if is_unlock:
+        supabase.table("user_profiles") \
+            .update({"current_login_status": None, "failed_password_attempts": 0}) \
+            .eq("user_id", user_id) \
+            .execute()
+        return jsonify({"status": "unlocked"}), 200
+
+    # Normal 2FA success: mark the login attempt as successful and log in.
     supabase.table("login_attempts") \
-    .update({"successful_login": True}) \
-    .eq("login_attempt_id", login_attempt_id) \
-    .execute()
+        .update({"successful_login": True}) \
+        .eq("login_attempt_id", login_attempt_id) \
+        .execute()
 
     enrollment_count = count_successful_login_attempts(user_id)
     user_status = "logged in" if enrollment_count >= REQUIRED_ENROLLMENT_SAMPLES else None
-    
+
     # Enrollment attempts stay login-capable until enough samples are collected.
+    # Also clear any stale failure counter on successful authentication.
     supabase.table("user_profiles") \
-        .update({"current_login_status": user_status}) \
+        .update({"current_login_status": user_status, "failed_password_attempts": 0}) \
         .eq("user_id", user_id) \
         .execute()
-    
+
     return jsonify({
         "status": "accepted",
         **enrollment_payload(enrollment_count),
@@ -561,8 +699,87 @@ def resend_code():
 
     return jsonify({"status": "code sent"}), 200
 
-# create new login attempt in DB, return login attempt id 
-def create_login_attempt(supabase, user_id, username, raw_data):
+# ---------------------------------------------------------------------------
+# Brute-force protection helpers
+# ---------------------------------------------------------------------------
+
+def _handle_failed_password(user_id, username, current_failures):
+    # Increment the consecutive wrong-password counter.
+    # If the threshold is reached, send an unlock code and set the account to
+    # "password_locked" so no further login attempts can proceed until the user
+    # verifies their identity via email. Returns a dict with the unlock
+    # login_attempt_id and (in demo mode) the OTP if the threshold was just
+    # hit, otherwise returns None.
+    new_count = current_failures + 1
+
+    if new_count < FAILED_PASSWORD_THRESHOLD:
+        supabase.table("user_profiles") \
+            .update({"failed_password_attempts": new_count}) \
+            .eq("user_id", user_id) \
+            .execute()
+        return None
+
+    # Threshold reached. Create a minimal login_attempt to anchor the OTP
+    # record (send_code requires a login_attempt_id with a matching row),
+    # then send the unlock code. If sending fails we leave the account
+    # unlocked rather than stranding the user with no way to recover.
+    unlock_attempt_id = create_login_attempt(supabase, user_id, username, {})
+    try:
+        otp = send_code(user_id, username, unlock_attempt_id)
+    except Exception:
+        app.logger.exception("send_code failed during password-lock for %s", username)
+        return None
+
+    supabase.table("user_profiles") \
+        .update({
+            "failed_password_attempts": new_count,
+            "current_login_status": "password_locked",
+        }) \
+        .eq("user_id", user_id) \
+        .execute()
+
+    return {
+        "login_attempt_id": unlock_attempt_id,
+        "demo_otp": otp if DEMO_MODE else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Replay-detection helpers
+# ---------------------------------------------------------------------------
+
+def _hash_events(raw_data):
+    # Canonicalize the events array (sort_keys so key ordering can't create
+    # two different hashes for the same payload) and return its SHA-256 digest.
+    # Returns None when there are no events so callers can skip the DB check.
+    events = (raw_data or {}).get("events") or []
+    if not events:
+        return None
+    canonical = json.dumps(events, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _is_replayed_payload(user_id, events_hash):
+    # An exact payload match within 24 hours is treated as a replay.
+    # 24 h is wide enough to cover an attacker who captures all 5 enrollment
+    # logins in one session and immediately tries to reuse them, while being
+    # narrow enough not to bother legitimate users who might return the next day
+    # (and whose live capture will differ by at least a few milliseconds anyway).
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    result = (
+        supabase.table("login_attempts")
+        .select("login_attempt_id")
+        .eq("user_id", user_id)
+        .eq("events_hash", events_hash)
+        .gte("created_at", cutoff)
+        .limit(1)
+        .execute()
+    )
+    return bool(result.data)
+
+
+# create new login attempt in DB, return login attempt id
+def create_login_attempt(supabase, user_id, username, raw_data, events_hash=None):
     login_attempt_id = str(uuid.uuid4())
      # 1. fetch profile
     profile = (
@@ -579,14 +796,15 @@ def create_login_attempt(supabase, user_id, username, raw_data):
 
     # 2. create login attempt row
     new_attempt = {
-        "login_attempt_id": login_attempt_id, 
+        "login_attempt_id": login_attempt_id,
         "user_id": user_id,
         "username": username,
         "login_number": login_number,
         "two_fa_invoked": False,
         "successful_login": None,
         "confidence_score": None,
-        "raw_data": raw_data or {}
+        "raw_data": raw_data or {},
+        "events_hash": events_hash,
     }
 
     # 3. insert into login_attempts

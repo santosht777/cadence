@@ -1,5 +1,16 @@
 -- Cadence backend schema. Run against the Postgres database backing
 -- your Supabase stack (local or cloud). Idempotent: safe to re-run.
+--
+-- Migration for existing databases: adds events_hash to login_attempts.
+-- The CREATE TABLE block above already includes it for fresh installs.
+alter table if exists public.login_attempts
+    add column if not exists events_hash text;
+
+alter table if exists public.user_profiles
+    add column if not exists failed_password_attempts integer not null default 0;
+
+create index if not exists login_attempts_replay_idx
+    on public.login_attempts (user_id, events_hash, created_at);
 
 create extension if not exists "pgcrypto";
 
@@ -12,6 +23,9 @@ create table if not exists public.user_profiles (
     threshold real not null default 0.5,
     current_login_status text,
     number_login_attempts integer not null default 0,
+    -- Counts consecutive wrong passwords; resets to 0 on any successful auth.
+    -- Reaching the threshold triggers a password-unlock email flow.
+    failed_password_attempts integer not null default 0,
     created_at timestamptz not null default now()
 );
 
@@ -30,6 +44,8 @@ create table if not exists public.login_attempts (
     successful_login boolean,
     confidence_score real,
     raw_data jsonb,
+    -- SHA-256 of the canonicalized events array; used to detect replayed payloads.
+    events_hash text,
     created_at timestamptz not null default now()
 );
 
@@ -37,6 +53,9 @@ create index if not exists login_attempts_user_idx
     on public.login_attempts (user_id, login_number desc);
 create index if not exists login_attempts_username_success_idx
     on public.login_attempts (username, successful_login);
+-- Supports the replay-detection query: (user_id, events_hash) within a time window.
+create index if not exists login_attempts_replay_idx
+    on public.login_attempts (user_id, events_hash, created_at);
 
 -- Pending OTP per login attempt. Deleted on success; expires_at gates
 -- replay; attempt_count caps verification tries at 3.
