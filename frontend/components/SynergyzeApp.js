@@ -50,7 +50,12 @@ async function hashPassword(plaintext) {
 // Convert a PEM string (-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----)
 // into a raw ArrayBuffer suitable for crypto.subtle.importKey.
 function pemToBuffer(pem) {
-  const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  // Strip literal \n sequences (Vercel env var mangling) as well as real
+  // whitespace before decoding — both can corrupt the base64 if left in.
+  const b64 = pem
+    .replace(/\\n/g, '')
+    .replace(/-----[^-]+-----/g, '')
+    .replace(/\s+/g, '');
   const binary = atob(b64);
   const buf = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
