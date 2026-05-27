@@ -24,6 +24,55 @@ function getApiBase() {
   );
 }
 
+// Hash the password client-side before it ever leaves the browser.
+// This means a shoulder surfer watching the Network tab or a leaked request
+// log never sees the plaintext password. The hash is what Supabase stores
+// (then bcrypt-hashes again server-side), so it must be applied consistently
+// at both registration and login.
+async function hashPassword(plaintext) {
+  const encoded = new TextEncoder().encode(plaintext);
+  const buf = await crypto.subtle.digest('SHA-256', encoded);
+  return Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// Convert a PEM string (-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----)
+// into a raw ArrayBuffer suitable for crypto.subtle.importKey.
+function pemToBuffer(pem) {
+  const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  const binary = atob(b64);
+  const buf = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
+  return buf.buffer;
+}
+
+// Hybrid RSA-OAEP + AES-256-GCM encryption.
+// RSA alone can't encrypt arbitrary-length data, so we generate an ephemeral
+// AES key per request, encrypt the events JSON with it, then wrap the AES key
+// with the server's RSA public key. Only the server's private key can unwrap it.
+async function encryptEvents(events, rsaCryptoKey) {
+  const aesKey = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 }, true, ['encrypt']
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    aesKey,
+    new TextEncoder().encode(JSON.stringify(events))
+  );
+  const rawAesKey = await crypto.subtle.exportKey('raw', aesKey);
+  const encryptedKey = await crypto.subtle.encrypt(
+    { name: 'RSA-OAEP' }, rsaCryptoKey, rawAesKey
+  );
+  const toB64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+  return {
+    encrypted_key: toB64(encryptedKey),
+    iv:            toB64(iv),
+    ciphertext:    toB64(ciphertext),
+  };
+}
+
 function Status({ value }) {
   const kind = value?.kind ? ` is-${value.kind}` : '';
   return <p className={`auth-meta${kind}`} data-form-status>{value?.message ?? ''}</p>;
@@ -80,6 +129,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
   const twofaCodeRef = useRef(null);
   const activeCaptureRef = useRef(null);
   const pendingAuthRef = useRef({ username: null, loginAttemptId: null });
+  const rsaPublicKeyRef = useRef(null);
 
   const setStatus = useCallback((form, message, kind = '') => {
     setStatuses((current) => ({
@@ -173,6 +223,24 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
   }, [showView]);
 
   useEffect(() => {
+    // Fetch the server's RSA public key once on mount and keep it in a ref so
+    // every login attempt can encrypt its keystroke payload without an extra
+    // round-trip. If the fetch fails we proceed without it and the server will
+    // reject the unencrypted payload — the user sees a generic login error.
+    fetch(`${getApiBase()}/public-key`)
+      .then(r => r.json())
+      .then(({ public_key }) =>
+        crypto.subtle.importKey(
+          'spki', pemToBuffer(public_key),
+          { name: 'RSA-OAEP', hash: 'SHA-256' },
+          false, ['encrypt']
+        )
+      )
+      .then(key => { rsaPublicKeyRef.current = key; })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     const syncRoute = () => showView(readRouteFromLocation(), { replace: true });
     syncRoute();
     window.addEventListener('popstate', syncRoute);
@@ -204,10 +272,22 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       setStatus('register', 'Please fill in every field.', 'error');
       return;
     }
+    // Policy checks must live here — once the password is hashed the server
+    // only sees a 64-char hex string and these conditions can never trigger.
+    if (password.length < 8) {
+      setStatus('register', 'Password must be at least 8 characters.', 'error');
+      return;
+    }
+    if (password.toLowerCase().includes(username.toLowerCase())) {
+      setStatus('register', 'Password must not contain your username.', 'error');
+      return;
+    }
+
+    const hashedPassword = await hashPassword(password);
 
     setStatus('register', 'Disrupting the auth provider...');
     try {
-      const { ok, json } = await api('/signup', { email, username, password });
+      const { ok, json } = await api('/signup', { email, username, password: hashedPassword });
       if (json.status === 'signup_success') {
         setStatus('register', 'Account created. Redirecting to sign in...', 'success');
         window.setTimeout(() => {
@@ -250,11 +330,22 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       attachCapture(loginPasswordRef.current);
       return;
     }
-    const raw_data = sample ? { events: sample.events } : { events: [] };
+    const events = sample ? sample.events : [];
+    const hashedPassword = await hashPassword(password);
+
+    // Encrypt the keystroke events with the server's RSA public key before
+    // they leave the browser. An observer in dev tools sees only ciphertext —
+    // no timing values to copy or shift by a millisecond. The server decrypts
+    // before the replay-hash check and the model ever see the events.
+    if (!rsaPublicKeyRef.current) {
+      setStatus('login', 'Encryption key not ready — please try again.', 'error');
+      return;
+    }
+    const raw_data = await encryptEvents(events, rsaPublicKeyRef.current);
 
     setStatus('login', 'Analyzing your typing rhythm...');
     try {
-      const { json } = await api('/authenticate', { username, password, raw_data });
+      const { json } = await api('/authenticate', { username, password: hashedPassword, raw_data });
 
       switch (json.status) {
         case 'accepted':
@@ -287,8 +378,19 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
             'error'
           );
           return;
+        case 'password_locked':
+          // Too many wrong passwords — an unlock code was emailed to the owner.
+          if (json.login_attempt_id) {
+            pendingAuthRef.current = { username, loginAttemptId: json.login_attempt_id };
+            setDemoOtp(json.demo_otp || null);
+            setStatus('login', 'Too many failed attempts — check your email for an unlock code.', 'error');
+            window.setTimeout(() => showView('twofa'), 800);
+          } else {
+            setStatus('login', 'Account locked due to too many failed attempts. Check your email for an unlock code.', 'error');
+          }
+          return;
         case 'user not found':
-          setStatus('login', 'No account with that username.', 'error');
+          setStatus('login', 'Invalid username or password.', 'error');
           return;
         default:
           setStatus('login', json.message || 'Login failed. Try again.', 'error');
@@ -322,6 +424,14 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
         code
       });
 
+      if (json.status === 'unlocked') {
+        // This was a password-unlock verification, not a real login.
+        // Clear pending state and send the user back to sign in normally.
+        pendingAuthRef.current = { username: null, loginAttemptId: null };
+        setStatus('twofa', 'Account unlocked. Please sign in again.', 'success');
+        window.setTimeout(() => showView('login'), 1200);
+        return;
+      }
       if (json.status === 'accepted') {
         const verifiedUsername = pendingAuth.username;
         pendingAuthRef.current = { username: null, loginAttemptId: null };
@@ -723,6 +833,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
             <a className="auth-back" href="/login" onClick={routeTo('login')}>← back to sign in</a>
             <h1 className="auth-title">Verify it's you</h1>
             <p className="auth-sub">We sent a 6-digit code to your email. It's good for 5 minutes.</p>
+            <p className="auth-sub">Don't worry - we don't care how you type this part.</p>
 
             <div className="demo-banner" id="demo-banner" hidden={!demoOtp}>
               <span className="demo-banner-label">Demo mode</span>
