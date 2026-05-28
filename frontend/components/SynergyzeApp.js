@@ -238,17 +238,13 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
   }, [showView]);
 
   useEffect(() => {
-    // Read the RSA public key from the build-time env var instead of fetching
-    // it at runtime. The public key is safe to embed — only the private key
-    // (kept on the server) can decrypt. Set NEXT_PUBLIC_RSA_PUBLIC_KEY in the
-    // frontend Vercel project to the PEM value from the backend /public-key endpoint.
-    const pem = process.env.NEXT_PUBLIC_RSA_KEY;
-    if (!pem) return;
-    crypto.subtle.importKey(
-      'spki', pemToBuffer(pem),
-      { name: 'RSA-OAEP', hash: 'SHA-256' },
-      false, ['encrypt']
-    )
+    fetch(`${getApiBase()}/public-key`)
+      .then(r => r.json())
+      .then(({ public_key }) => crypto.subtle.importKey(
+        'spki', pemToBuffer(public_key),
+        { name: 'RSA-OAEP', hash: 'SHA-256' },
+        false, ['encrypt']
+      ))
       .then(key => { rsaPublicKeyRef.current = key; })
       .catch(() => {});
   }, []);
