@@ -28,27 +28,6 @@ require() {
         || fail "Missing prerequisite: $1.${2:+ $2}"
 }
 
-apply_schema() {
-    if command -v psql >/dev/null 2>&1; then
-        psql "$DB_URL" -v ON_ERROR_STOP=1 -q -f "$SCHEMA_FILE"
-        return
-    fi
-
-    info "psql not found locally; applying schema through the Supabase DB container"
-    DB_CONTAINER="$(
-        docker ps --format '{{.Names}}' \
-            | grep '^supabase_db_' \
-            | head -n 1 \
-            || true
-    )"
-    if [ -z "$DB_CONTAINER" ]; then
-        fail "Could not find a running Supabase database container."
-    fi
-    docker exec -i "$DB_CONTAINER" \
-        psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
-        <"$SCHEMA_FILE"
-}
-
 bold "[1/5] Checking prerequisites"
 require python3 "Install Python 3.11 or 3.12. (3.13 may lack TensorFlow wheels and force a long source build.)"
 PY_VERSION="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
@@ -110,7 +89,7 @@ API_URL="${API_URL:?supabase status did not return API_URL}"
 SERVICE_ROLE_KEY="${SERVICE_ROLE_KEY:?supabase status did not return SERVICE_ROLE_KEY}"
 
 bold "[4/5] Applying schema"
-apply_schema
+DATABASE_URL="$DB_URL" CADENCE_SCHEMA_FILE="$SCHEMA_FILE" bash "$REPO_ROOT/scripts/apply_schema.sh"
 ok "schema applied"
 
 bold "[5/5] Writing $ENV_FILE"
@@ -122,9 +101,10 @@ SUPABASE_URL=$API_URL
 SUPABASE_KEY=$SERVICE_ROLE_KEY
 RESEND_KEY=
 CADENCE_DEMO_MODE=1
+CADENCE_ALLOW_OPEN_ADMIN=1
 CADENCE_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173
 EOF
-ok "wrote $ENV_FILE (demo mode on, resend disabled)"
+ok "wrote $ENV_FILE (demo mode on, open admin enabled for local development)"
 
 cat <<NEXT
 
