@@ -1,0 +1,71 @@
+# Render Blueprint for the Cadence Flask API deployment.
+# Source: https://render.com/docs/blueprint-spec
+services:
+  - type: keyvalue
+    name: cadence-rate-limit
+    plan: starter
+    region: oregon
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+
+  - type: web
+    name: cadence-api
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install --upgrade pip && pip install -r backend/requirements.txt
+    startCommand: cd backend && gunicorn app:app
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    buildFilter:
+      paths:
+        - backend/**
+        - models/**
+        - model.py
+        - util.py
+        - render.yaml
+      ignoredPaths:
+        - frontend/**
+        - packages/**
+        - docs/**
+        - examples/**
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: CADENCE_DEMO_MODE
+        value: "0"
+      - key: CADENCE_ALLOW_OPEN_ADMIN
+        value: "0"
+      - key: CADENCE_RATE_LIMIT_STORAGE_URI
+        fromService:
+          type: keyvalue
+          name: cadence-rate-limit
+          property: connectionString
+      - key: CADENCE_ADMIN_RATE_LIMIT
+        value: 30 per minute; 300 per hour
+      - key: CADENCE_PUBLIC_REGISTRATION_RATE_LIMIT
+        value: 10 per minute; 100 per hour
+      - key: CADENCE_PLATFORM_WRITE_RATE_LIMIT
+        value: 120 per minute; 5000 per hour
+      - key: CADENCE_PLATFORM_SCORE_RATE_LIMIT
+        value: 240 per minute; 10000 per hour
+      - key: CADENCE_RAW_DATA_RETENTION_DAYS
+        value: "90"
+      - key: CADENCE_REGISTRATION_RETENTION_DAYS
+        value: "365"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: CADENCE_ADMIN_TOKEN
+        sync: false
+      - key: CADENCE_RSA_PRIVATE_KEY
+        sync: false
+      - key: CADENCE_CORS_ORIGINS
+        sync: false
+      - key: RESEND_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: DATABASE_URL
+        sync: false

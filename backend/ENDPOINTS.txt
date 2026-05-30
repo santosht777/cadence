@@ -209,7 +209,361 @@ Responses:
   {"status": "error", "message": "missing username"} - 400
 
 
-3. LOGIN STATUS FIELD
+3. PLATFORM API ENDPOINTS
+================================================================================
+
+The /v1/* endpoints let registered applications use Cadence typing
+analysis without adopting the bundled demo authentication UI.
+
+Authentication:
+- POST /v1/app-registrations is public and creates a pending request.
+- POST /v1/apps and POST /v1/apps/<application_id>/api-keys require
+  X-Cadence-Admin-Token or Authorization: Bearer <CADENCE_ADMIN_TOKEN>.
+  If CADENCE_ADMIN_TOKEN is missing, admin endpoints fail closed unless
+  CADENCE_ALLOW_OPEN_ADMIN=1 is set for local/demo development.
+- End-user, enrollment, and scoring endpoints require
+  Authorization: Bearer <sk_live_...>.
+- Store sk_live keys only in trusted server-side code. Browser clients
+  should capture samples with the npm package, send them to their own
+  backend, and have that backend call Cadence.
+
+
+POST /v1/app-registrations
+--------------------------
+Purpose: Let a developer submit an application registration request without an
+         admin token. Operators approve requests before API keys are issued.
+
+Request Body:
+{
+  "name": "string (required)",
+  "contact_email": "string (required)",
+  "slug": "string (optional)",
+  "allowed_origins": ["https://app.example.com"],
+  "use_case": "string (optional)"
+}
+
+Response:
+{
+  "status": "submitted",
+  "registration": {
+    "app_registration_id": "uuid",
+    "status": "pending",
+    ...
+  },
+  "lookup_token": "reg_status_..."
+} - 201
+
+
+GET /v1/app-registrations/<app_registration_id>/status
+------------------------------------------------------
+Purpose: Let the requesting developer check status with the one-time lookup
+         token returned by POST /v1/app-registrations.
+
+Headers:
+  Authorization: Bearer <reg_status_...>
+
+Response:
+{
+  "status": "ok",
+  "registration": {
+    "app_registration_id": "uuid",
+    "status": "pending" | "approved" | "rejected",
+    "application_id": "uuid or null",
+    ...
+  }
+} - 200
+
+
+GET /v1/app-registrations
+-------------------------
+Purpose: List developer registration requests for operator review.
+
+Response:
+{
+  "status": "ok",
+  "registrations": [...]
+} - 200
+
+
+POST /v1/app-registrations/<app_registration_id>/approve
+--------------------------------------------------------
+Purpose: Approve a pending developer registration request, create the
+         application, and issue the first server-side API key. The full API key
+         is returned once.
+
+Request Body:
+{
+  "key_name": "production"
+}
+
+Response:
+{
+  "status": "approved",
+  "registration": {...},
+  "application": {...},
+  "api_key": {
+    "api_key_id": "uuid",
+    "application_id": "uuid",
+    "name": "production",
+    "key_prefix": "sk_live_...",
+    "key": "sk_live_..."
+  }
+} - 201
+
+
+POST /v1/app-registrations/<app_registration_id>/reject
+-------------------------------------------------------
+Purpose: Reject a pending developer registration request.
+
+Response:
+{
+  "status": "rejected",
+  "registration": {...}
+} - 200
+
+
+POST /v1/apps
+-------------
+Purpose: Register an integrating application.
+
+Request Body:
+{
+  "name": "string (required)",
+  "slug": "string (optional)",
+  "allowed_origins": ["https://app.example.com"]
+}
+
+Responses:
+- Created:
+  {"status": "created", "application": {...}} - 201
+- Error:
+  {"status": "error", "message": "..."} - 400
+- Unauthorized:
+  {"status": "unauthorized", "message": "missing or invalid admin token"} - 401
+- Misconfigured:
+  {"status": "misconfigured", "message": "CADENCE_ADMIN_TOKEN is required for admin endpoints"} - 503
+
+
+GET /v1/apps
+------------
+Purpose: List registered applications for operator administration.
+
+Response:
+{
+  "status": "ok",
+  "applications": [...]
+} - 200
+
+
+POST /v1/apps/<application_id>/api-keys
+--------------------------------------
+Purpose: Generate a server-side API key for an application. The full key is
+         returned once and only its prefix/hash are stored.
+
+Request Body:
+{
+  "name": "string (optional, defaults to default)"
+}
+
+Responses:
+- Created:
+  {
+    "status": "created",
+    "api_key": {
+      "api_key_id": "uuid",
+      "application_id": "uuid",
+      "name": "production",
+      "key_prefix": "sk_live_...",
+      "key": "sk_live_..."
+    }
+  } - 201
+- Application not found:
+  {"status": "not_found", "message": "application not found"} - 404
+
+
+GET /v1/apps/<application_id>/api-keys
+-------------------------------------
+Purpose: List an application's API keys without returning full key hashes or
+         secrets.
+
+Response:
+{
+  "status": "ok",
+  "api_keys": [
+    {
+      "api_key_id": "uuid",
+      "application_id": "uuid",
+      "name": "production",
+      "key_prefix": "sk_live_...",
+      "revoked_at": null,
+      "last_used_at": "timestamp or null",
+      "created_at": "timestamp"
+    }
+  ]
+} - 200
+
+
+GET /v1/apps/<application_id>/usage
+----------------------------------
+Purpose: Summarize operator-facing usage for an application.
+
+Response:
+{
+  "status": "ok",
+  "usage": {
+    "application": {...},
+    "api_keys": {
+      "total": 2,
+      "active": 1,
+      "revoked": 1,
+      "last_used_at": "timestamp or null"
+    },
+    "end_users": {
+      "total": 120,
+      "enrolled": 96
+    },
+    "typing_samples": {
+      "total": 560,
+      "successful": 520,
+      "enrollment": 500,
+      "score_stored": 20
+    },
+    "score_requests": {
+      "total": 430,
+      "accepted": 390,
+      "rejected": 40,
+      "acceptance_rate": 0.9069767441860465,
+      "avg_score_duration_ms": 18.4,
+      "p95_score_duration_ms": 42.1,
+      "reason_counts": {
+        "accepted": 390,
+        "low_confidence": 35,
+        "not_enrolled": 5
+      },
+      "last_scored_at": "timestamp or null"
+    }
+  }
+} - 200
+
+
+POST /v1/api-keys/<api_key_id>/revoke
+------------------------------------
+Purpose: Revoke a platform API key. Re-running this is idempotent.
+
+Responses:
+- Revoked:
+  {"status": "revoked", "api_key": {...}} - 200
+- API key not found:
+  {"status": "not_found", "message": "API key not found"} - 404
+
+
+POST /v1/end-users
+------------------
+Purpose: Create or fetch an application-scoped end user.
+
+Request Body:
+{
+  "external_user_id": "string (required)",
+  "threshold": 0.5,
+  "metadata": {"plan": "pro"}
+}
+
+Response:
+{
+  "status": "ok",
+  "end_user": {...},
+  "enrolled": false,
+  "enrollment_count": 0,
+  "enrollment_required": 5,
+  "enrollment_samples_needed": 5
+} - 200
+
+
+GET /v1/end-users/<external_user_id>
+-----------------------------------
+Purpose: Fetch enrollment state for an application-scoped end user.
+
+Responses:
+- Found:
+  {"status": "ok", "end_user": {...}, ...enrollment fields...} - 200
+- Not found:
+  {"status": "not_found", "message": "end user not found"} - 404
+
+
+POST /v1/enroll
+---------------
+Purpose: Store a successful typing sample for future model comparison.
+
+Request Body:
+{
+  "external_user_id": "string (required)",
+  "raw_data": {
+    "events": [
+      {"type": "down" | "up", "code": "string", "t": float}
+    ]
+  },
+  "source": "enrollment",
+  "successful": true,
+  "quality_score": 0.93,
+  "flags": []
+}
+
+raw_data may also be {"keystrokes": [...]} or a bare list of keystroke
+objects with hold_time, flight_time, and down_down.
+
+Response:
+{
+  "status": "enrolled",
+  "end_user_id": "uuid",
+  "external_user_id": "string",
+  "enrolled": false,
+  "enrollment_count": 1,
+  "enrollment_required": 5,
+  "enrollment_samples_needed": 4
+} - 201
+
+
+POST /v1/score
+--------------
+Purpose: Score a fresh typing sample against the end user's enrollment
+         samples.
+
+Request Body:
+{
+  "external_user_id": "string (required)",
+  "raw_data": {"events": [...]},
+  "threshold": 0.5,
+  "store_successful_sample": false
+}
+
+Responses:
+- Not enrolled yet:
+  {
+    "status": "ok",
+    "score": null,
+    "confidence": null,
+    "accepted": false,
+    "match": false,
+    "reason": "not_enrolled",
+    ...enrollment fields...
+  } - 200
+- Scored:
+  {
+    "status": "ok",
+    "score_request_id": "uuid",
+    "score": 0.82,
+    "confidence": 0.82,
+    "accepted": true,
+    "match": true,
+    "threshold": 0.5,
+    "reason": "accepted",
+    ...enrollment fields...
+  } - 200
+- Unauthorized or disallowed origin:
+  {"status": "unauthorized" | "forbidden", "message": "..."} - 401/403
+
+
+4. LOGIN STATUS FIELD
 ================================================================================
 
 The user_profiles table has a "current_login_status" column with values:
@@ -219,7 +573,7 @@ The user_profiles table has a "current_login_status" column with values:
 - null           : Initial state, logged out, or enrollment still needs more samples
 
 
-4. REQUEST/RESPONSE FLOW EXAMPLE
+5. REQUEST/RESPONSE FLOW EXAMPLE
 ================================================================================
 
 Step 1: Keystroke Login Attempt
@@ -299,7 +653,7 @@ Database Updates:
 - current_login_status set to null
 
 
-5. RETRY LOGIC
+6. RETRY LOGIC
 ================================================================================
 
 When verifying 2FA code:
@@ -314,7 +668,7 @@ whether the code is correct or incorrect. After 3 attempts, further attempts
 are rejected and the account is locked.
 
 
-6. ML SCORING
+7. ML SCORING
 ================================================================================
 
 ML Model Requirements:
@@ -330,7 +684,7 @@ Score Decision:
 - score < user_threshold → Trigger 2FA, set status to "pending 2fa"
 
 
-7. DATA MODELS
+8. DATA MODELS
 ================================================================================
 
 user_profiles table:
@@ -356,5 +710,34 @@ _2fa table:
 - otp_hash: SHA256 hash of the 6-digit code
 - expires_at: timestamp when code expires (5 minutes)
 - attempt_count: counter for verification attempts (max 3)
+
+applications table:
+- application_id: registered third-party application ID
+- name/slug: display name and unique URL-safe slug
+- allowed_origins: optional browser origins permitted for API-key calls
+
+api_keys table:
+- api_key_id: key record ID
+- application_id: owning application
+- key_prefix: lookup prefix for the presented sk_live key
+- key_hash: SHA-256 hash of the full key
+- revoked_at/last_used_at: key lifecycle and audit fields
+
+end_users table:
+- end_user_id: Cadence-scoped end-user ID
+- external_user_id: integrating application's user ID
+- threshold: optional per-user model decision threshold
+- metadata: application-owned JSON object
+
+typing_samples table:
+- raw_data: captured Sample events or precomputed keystroke features
+- successful: whether this sample can be used for enrollment
+- quality_score/confidence_score/flags: capture and model metadata
+
+score_requests table:
+- raw_data: submitted scoring sample
+- score/threshold/accepted/reason: model decision audit trail
+- score_duration_ms: request-local scoring latency used for operator dashboards
+- enrolled/enrollment_count/enrollment_required: enrollment state at scoring time
 
 ================================================================================

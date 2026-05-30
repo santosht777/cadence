@@ -8,6 +8,7 @@ import base64
 import hmac
 import re
 import resend
+import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import secrets
@@ -44,7 +45,7 @@ model_service = CadenceModelService()
 limiter = Limiter(
     get_remote_address,
     app=app,
-    storage_uri="memory://",
+    storage_uri=os.getenv("CADENCE_RATE_LIMIT_STORAGE_URI", "memory://"),
     default_limits=[],
 )
 
@@ -84,7 +85,9 @@ def add_cors_headers(response):
         response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Cadence-Admin-Token"
+        )
     return response
 
 
@@ -95,8 +98,15 @@ def cors_preflight(_any=None):
 REQUIRED_ENROLLMENT_SAMPLES = int(
     os.getenv("CADENCE_REQUIRED_ENROLLMENT_SAMPLES", "5")
 )
-ADMIN_TOKEN = os.getenv("CADENCE_ADMIN_TOKEN")
+ADMIN_TOKEN = os.getenv("CADENCE_ADMIN_TOKEN", "").strip()
+ALLOW_OPEN_ADMIN = os.getenv("CADENCE_ALLOW_OPEN_ADMIN", "0").lower() in {"1", "true", "yes"}
 API_KEY_PREFIX_LENGTH = 18
+ADMIN_RATE_LIMIT = os.getenv("CADENCE_ADMIN_RATE_LIMIT", "30 per minute; 300 per hour")
+PUBLIC_REGISTRATION_RATE_LIMIT = os.getenv(
+    "CADENCE_PUBLIC_REGISTRATION_RATE_LIMIT", "10 per minute; 100 per hour"
+)
+PLATFORM_WRITE_RATE_LIMIT = os.getenv("CADENCE_PLATFORM_WRITE_RATE_LIMIT", "120 per minute; 5000 per hour")
+PLATFORM_SCORE_RATE_LIMIT = os.getenv("CADENCE_PLATFORM_SCORE_RATE_LIMIT", "240 per minute; 10000 per hour")
 
 # Two clients on purpose:
 #   `supabase`      → service-role, used for ALL table reads/writes.
@@ -173,9 +183,62 @@ def generate_api_key():
     return f"sk_live_{secrets.token_urlsafe(32)}"
 
 
+def validate_allowed_origins(value):
+    allowed_origins = value or []
+    if not isinstance(allowed_origins, list) or not all(
+        isinstance(origin, str) for origin in allowed_origins
+    ):
+        return None, "allowed_origins must be a list of strings"
+    return allowed_origins, None
+
+
+def public_api_key_row(key_row):
+    return {
+        "api_key_id": key_row.get("api_key_id"),
+        "application_id": key_row.get("application_id"),
+        "name": key_row.get("name"),
+        "key_prefix": key_row.get("key_prefix"),
+        "revoked_at": key_row.get("revoked_at"),
+        "last_used_at": key_row.get("last_used_at"),
+        "created_at": key_row.get("created_at"),
+    }
+
+
+def public_app_registration_row(registration_row):
+    return {
+        "app_registration_id": registration_row.get("app_registration_id"),
+        "name": registration_row.get("name"),
+        "slug": registration_row.get("slug"),
+        "contact_email": registration_row.get("contact_email"),
+        "allowed_origins": registration_row.get("allowed_origins") or [],
+        "use_case": registration_row.get("use_case"),
+        "status": registration_row.get("status"),
+        "application_id": registration_row.get("application_id"),
+        "reviewed_at": registration_row.get("reviewed_at"),
+        "created_at": registration_row.get("created_at"),
+        "updated_at": registration_row.get("updated_at"),
+    }
+
+
+def generate_registration_lookup_token():
+    return f"reg_status_{secrets.token_urlsafe(32)}"
+
+
 def require_admin_if_configured():
     if not ADMIN_TOKEN:
-        return None
+        if ALLOW_OPEN_ADMIN:
+            return None
+        return error_response(
+            "CADENCE_ADMIN_TOKEN is required for admin endpoints",
+            503,
+            "misconfigured",
+        )
+    if len(ADMIN_TOKEN) < 32:
+        return error_response(
+            "CADENCE_ADMIN_TOKEN must be at least 32 characters",
+            503,
+            "misconfigured",
+        )
     provided = request.headers.get("X-Cadence-Admin-Token", "")
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
@@ -217,13 +280,19 @@ def require_api_key(handler):
         app_rows = app_result.data or []
         if not app_rows:
             return error_response("API key application not found", 401, "unauthorized")
+        app_row = app_rows[0]
+
+        origin = request.headers.get("Origin")
+        allowed_origins = app_row.get("allowed_origins") or []
+        if origin and allowed_origins and origin not in allowed_origins:
+            return error_response("origin is not allowed for this application", 403, "forbidden")
 
         supabase.table("api_keys") \
             .update({"last_used_at": datetime.now(timezone.utc).isoformat()}) \
             .eq("api_key_id", key_row["api_key_id"]) \
             .execute()
         request.cadence_api_key = key_row
-        request.cadence_application = app_rows[0]
+        request.cadence_application = app_row
         return handler(*args, **kwargs)
 
     return wrapped
@@ -232,6 +301,34 @@ def require_api_key(handler):
 def get_json_body():
     data = request.get_json(silent=True)
     return data if isinstance(data, dict) else {}
+
+
+def create_application_record(data):
+    name = (data.get("name") or "").strip()
+    if not name:
+        return None, error_response("missing name")
+
+    allowed_origins, origins_error = validate_allowed_origins(data.get("allowed_origins"))
+    if origins_error:
+        return None, error_response(origins_error)
+
+    payload = {
+        "name": name,
+        "slug": slugify(data.get("slug") or name),
+        "allowed_origins": allowed_origins,
+    }
+    contact_email = (data.get("contact_email") or "").strip()
+    if contact_email:
+        payload["contact_email"] = contact_email
+    registration_id = data.get("app_registration_id")
+    if registration_id:
+        payload["app_registration_id"] = registration_id
+
+    try:
+        result = supabase.table("applications").insert(payload).execute()
+    except Exception as exc:
+        return None, error_response(str(exc), 400)
+    return result.data[0], None
 
 
 def get_or_create_end_user(application_id, external_user_id, threshold=None, metadata=None):
@@ -290,6 +387,105 @@ def fetch_platform_enrollment_samples(end_user_id):
         if raw_data:
             samples.append(model_service.raw_data_to_sample(raw_data))
     return samples
+
+
+def latest_value(rows, key):
+    values = [row.get(key) for row in rows if row.get(key)]
+    return max(values) if values else None
+
+
+def percentile(values, percent):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = int(round((len(ordered) - 1) * percent))
+    return ordered[index]
+
+
+def build_platform_app_usage(application_id):
+    app_result = supabase.table("applications") \
+        .select("*") \
+        .eq("application_id", application_id) \
+        .execute()
+    app_rows = app_result.data or []
+    if not app_rows:
+        return None
+
+    api_keys = supabase.table("api_keys") \
+        .select("api_key_id, revoked_at, last_used_at, created_at") \
+        .eq("application_id", application_id) \
+        .execute().data or []
+    end_users = supabase.table("end_users") \
+        .select("end_user_id, created_at") \
+        .eq("application_id", application_id) \
+        .execute().data or []
+    typing_samples = supabase.table("typing_samples") \
+        .select("typing_sample_id, end_user_id, successful, source, created_at") \
+        .eq("application_id", application_id) \
+        .execute().data or []
+    score_requests = supabase.table("score_requests") \
+        .select("score_request_id, accepted, reason, score_duration_ms, created_at") \
+        .eq("application_id", application_id) \
+        .execute().data or []
+
+    successful_samples_by_user = {}
+    for sample in typing_samples:
+        if sample.get("successful") is True:
+            end_user_id = sample.get("end_user_id")
+            successful_samples_by_user[end_user_id] = (
+                successful_samples_by_user.get(end_user_id, 0) + 1
+            )
+
+    enrolled_end_users = sum(
+        1
+        for count in successful_samples_by_user.values()
+        if count >= REQUIRED_ENROLLMENT_SAMPLES
+    )
+    score_count = len(score_requests)
+    accepted_count = sum(1 for row in score_requests if row.get("accepted") is True)
+    score_durations = [
+        float(row["score_duration_ms"])
+        for row in score_requests
+        if row.get("score_duration_ms") is not None
+    ]
+    score_reasons = {}
+    for row in score_requests:
+        reason = row.get("reason") or "unknown"
+        score_reasons[reason] = score_reasons.get(reason, 0) + 1
+
+    return {
+        "application": app_rows[0],
+        "api_keys": {
+            "total": len(api_keys),
+            "active": sum(1 for row in api_keys if row.get("revoked_at") is None),
+            "revoked": sum(1 for row in api_keys if row.get("revoked_at") is not None),
+            "last_used_at": latest_value(api_keys, "last_used_at"),
+        },
+        "end_users": {
+            "total": len(end_users),
+            "enrolled": enrolled_end_users,
+        },
+        "typing_samples": {
+            "total": len(typing_samples),
+            "successful": sum(1 for row in typing_samples if row.get("successful") is True),
+            "enrollment": sum(1 for row in typing_samples if row.get("source") == "enrollment"),
+            "score_stored": sum(1 for row in typing_samples if row.get("source") == "score"),
+        },
+        "score_requests": {
+            "total": score_count,
+            "accepted": accepted_count,
+            "rejected": score_count - accepted_count,
+            "acceptance_rate": accepted_count / score_count if score_count else None,
+            "avg_score_duration_ms": (
+                sum(score_durations) / len(score_durations)
+                if score_durations
+                else None
+            ),
+            "p95_score_duration_ms": percentile(score_durations, 0.95),
+            "reason_counts": score_reasons,
+            "last_scored_at": latest_value(score_requests, "created_at"),
+        },
+    }
 
 
 def count_successful_login_attempts(user_id):
@@ -394,36 +590,230 @@ def _decrypt_events(raw_data):
 
 
 @app.post("/v1/apps")
+@limiter.limit(ADMIN_RATE_LIMIT)
 def create_platform_app():
     admin_error = require_admin_if_configured()
     if admin_error:
         return admin_error
 
+    application, app_error = create_application_record(get_json_body())
+    if app_error:
+        return app_error
+    return jsonify({"status": "created", "application": application}), 201
+
+
+@app.post("/v1/app-registrations")
+@limiter.limit(PUBLIC_REGISTRATION_RATE_LIMIT)
+def submit_platform_app_registration():
     data = get_json_body()
     name = (data.get("name") or "").strip()
+    contact_email = (data.get("contact_email") or "").strip()
     if not name:
         return error_response("missing name")
+    if not contact_email:
+        return error_response("missing contact_email")
 
-    allowed_origins = data.get("allowed_origins") or []
-    if not isinstance(allowed_origins, list) or not all(
-        isinstance(origin, str) for origin in allowed_origins
-    ):
-        return error_response("allowed_origins must be a list of strings")
+    allowed_origins, origins_error = validate_allowed_origins(data.get("allowed_origins"))
+    if origins_error:
+        return error_response(origins_error)
 
+    lookup_token = generate_registration_lookup_token()
     payload = {
         "name": name,
         "slug": slugify(data.get("slug") or name),
+        "contact_email": contact_email,
         "allowed_origins": allowed_origins,
+        "use_case": (data.get("use_case") or "").strip() or None,
+        "lookup_token_hash": hash_api_key(lookup_token),
+        "status": "pending",
     }
-    try:
-        result = supabase.table("applications").insert(payload).execute()
-    except Exception as exc:
-        return error_response(str(exc), 400)
+    result = supabase.table("app_registrations").insert(payload).execute()
+    return jsonify({
+        "status": "submitted",
+        "registration": public_app_registration_row(result.data[0]),
+        "lookup_token": lookup_token,
+    }), 201
 
-    return jsonify({"status": "created", "application": result.data[0]}), 201
+
+@app.get("/v1/app-registrations/<app_registration_id>/status")
+@limiter.limit(PUBLIC_REGISTRATION_RATE_LIMIT)
+def get_platform_app_registration_status(app_registration_id):
+    auth = request.headers.get("Authorization", "")
+    lookup_token = request.args.get("lookup_token", "").strip()
+    if auth.lower().startswith("bearer "):
+        lookup_token = auth.split(" ", 1)[1].strip()
+    if not lookup_token:
+        return error_response("missing lookup token", 401, "unauthorized")
+
+    result = supabase.table("app_registrations") \
+        .select("*") \
+        .eq("app_registration_id", app_registration_id) \
+        .execute()
+    rows = result.data or []
+    if not rows:
+        return error_response("registration not found", 404, "not_found")
+
+    registration = rows[0]
+    stored_hash = registration.get("lookup_token_hash")
+    if not stored_hash or not hmac.compare_digest(stored_hash, hash_api_key(lookup_token)):
+        return error_response("invalid lookup token", 401, "unauthorized")
+
+    return jsonify({
+        "status": "ok",
+        "registration": public_app_registration_row(registration),
+    })
+
+
+@app.get("/v1/app-registrations")
+@limiter.limit(ADMIN_RATE_LIMIT)
+def list_platform_app_registrations():
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    result = supabase.table("app_registrations") \
+        .select("*") \
+        .order("created_at", desc=True) \
+        .execute()
+    return jsonify({
+        "status": "ok",
+        "registrations": [
+            public_app_registration_row(row)
+            for row in result.data or []
+        ],
+    })
+
+
+@app.post("/v1/app-registrations/<app_registration_id>/approve")
+@limiter.limit(ADMIN_RATE_LIMIT)
+def approve_platform_app_registration(app_registration_id):
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    result = supabase.table("app_registrations") \
+        .select("*") \
+        .eq("app_registration_id", app_registration_id) \
+        .execute()
+    rows = result.data or []
+    if not rows:
+        return error_response("registration not found", 404, "not_found")
+
+    registration = rows[0]
+    if registration.get("status") == "approved" and registration.get("application_id"):
+        return jsonify({
+            "status": "approved",
+            "registration": public_app_registration_row(registration),
+            "application": {"application_id": registration["application_id"]},
+            "api_key": None,
+        })
+    if registration.get("status") == "rejected":
+        return error_response("registration already rejected", 400)
+
+    application, app_error = create_application_record({
+        "name": registration["name"],
+        "slug": registration.get("slug"),
+        "allowed_origins": registration.get("allowed_origins") or [],
+        "contact_email": registration.get("contact_email"),
+        "app_registration_id": app_registration_id,
+    })
+    if app_error:
+        return app_error
+
+    data = get_json_body()
+    api_key = generate_api_key()
+    key_payload = {
+        "application_id": application["application_id"],
+        "name": (data.get("key_name") or "default").strip() or "default",
+        "key_prefix": api_key[:API_KEY_PREFIX_LENGTH],
+        "key_hash": hash_api_key(api_key),
+    }
+    key_result = supabase.table("api_keys").insert(key_payload).execute()
+    key_row = key_result.data[0]
+
+    update_result = supabase.table("app_registrations") \
+        .update({
+            "status": "approved",
+            "application_id": application["application_id"],
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }) \
+        .eq("app_registration_id", app_registration_id) \
+        .execute()
+    updated_registration = (update_result.data or [registration])[0]
+
+    return jsonify({
+        "status": "approved",
+        "registration": public_app_registration_row(updated_registration),
+        "application": application,
+        "api_key": {
+            "api_key_id": key_row["api_key_id"],
+            "application_id": key_row["application_id"],
+            "name": key_row["name"],
+            "key_prefix": key_row["key_prefix"],
+            "key": api_key,
+        },
+    }), 201
+
+
+@app.post("/v1/app-registrations/<app_registration_id>/reject")
+@limiter.limit(ADMIN_RATE_LIMIT)
+def reject_platform_app_registration(app_registration_id):
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    result = supabase.table("app_registrations") \
+        .select("*") \
+        .eq("app_registration_id", app_registration_id) \
+        .execute()
+    rows = result.data or []
+    if not rows:
+        return error_response("registration not found", 404, "not_found")
+    if rows[0].get("status") == "approved":
+        return error_response("registration already approved", 400)
+
+    updated = supabase.table("app_registrations") \
+        .update({
+            "status": "rejected",
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }) \
+        .eq("app_registration_id", app_registration_id) \
+        .execute()
+    return jsonify({
+        "status": "rejected",
+        "registration": public_app_registration_row((updated.data or rows)[0]),
+    })
+
+
+@app.get("/v1/apps")
+@limiter.limit(ADMIN_RATE_LIMIT)
+def list_platform_apps():
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    result = supabase.table("applications") \
+        .select("*") \
+        .order("created_at", desc=True) \
+        .execute()
+    return jsonify({"status": "ok", "applications": result.data or []})
+
+
+@app.get("/v1/apps/<application_id>/usage")
+@limiter.limit(ADMIN_RATE_LIMIT)
+def get_platform_app_usage(application_id):
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    usage = build_platform_app_usage(application_id)
+    if usage is None:
+        return error_response("application not found", 404, "not_found")
+    return jsonify({"status": "ok", "usage": usage})
 
 
 @app.post("/v1/apps/<application_id>/api-keys")
+@limiter.limit(ADMIN_RATE_LIMIT)
 def create_platform_api_key(application_id):
     admin_error = require_admin_if_configured()
     if admin_error:
@@ -458,7 +848,57 @@ def create_platform_api_key(application_id):
     }), 201
 
 
+@app.get("/v1/apps/<application_id>/api-keys")
+@limiter.limit(ADMIN_RATE_LIMIT)
+def list_platform_api_keys(application_id):
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    app_result = supabase.table("applications") \
+        .select("application_id") \
+        .eq("application_id", application_id) \
+        .execute()
+    if not (app_result.data or []):
+        return error_response("application not found", 404, "not_found")
+
+    result = supabase.table("api_keys") \
+        .select("api_key_id, application_id, name, key_prefix, revoked_at, last_used_at, created_at") \
+        .eq("application_id", application_id) \
+        .order("created_at", desc=True) \
+        .execute()
+    return jsonify({"status": "ok", "api_keys": result.data or []})
+
+
+@app.post("/v1/api-keys/<api_key_id>/revoke")
+@limiter.limit(ADMIN_RATE_LIMIT)
+def revoke_platform_api_key(api_key_id):
+    admin_error = require_admin_if_configured()
+    if admin_error:
+        return admin_error
+
+    result = supabase.table("api_keys") \
+        .select("api_key_id, application_id, name, key_prefix, revoked_at, last_used_at, created_at") \
+        .eq("api_key_id", api_key_id) \
+        .execute()
+    rows = result.data or []
+    if not rows:
+        return error_response("API key not found", 404, "not_found")
+
+    key_row = rows[0]
+    if key_row.get("revoked_at") is None:
+        revoked_at = datetime.now(timezone.utc).isoformat()
+        update_result = supabase.table("api_keys") \
+            .update({"revoked_at": revoked_at}) \
+            .eq("api_key_id", api_key_id) \
+            .execute()
+        key_row = (update_result.data or [key_row])[0]
+
+    return jsonify({"status": "revoked", "api_key": public_api_key_row(key_row)})
+
+
 @app.post("/v1/end-users")
+@limiter.limit(PLATFORM_WRITE_RATE_LIMIT)
 @require_api_key
 def create_platform_end_user():
     data = get_json_body()
@@ -484,6 +924,7 @@ def create_platform_end_user():
 
 
 @app.get("/v1/end-users/<external_user_id>")
+@limiter.limit(PLATFORM_WRITE_RATE_LIMIT)
 @require_api_key
 def get_platform_end_user(external_user_id):
     result = supabase.table("end_users") \
@@ -504,6 +945,7 @@ def get_platform_end_user(external_user_id):
 
 
 @app.post("/v1/enroll")
+@limiter.limit(PLATFORM_WRITE_RATE_LIMIT)
 @require_api_key
 def platform_enroll():
     data = get_json_body()
@@ -544,6 +986,7 @@ def platform_enroll():
 
 
 @app.post("/v1/score")
+@limiter.limit(PLATFORM_SCORE_RATE_LIMIT)
 @require_api_key
 def platform_score():
     data = get_json_body()
@@ -559,6 +1002,7 @@ def platform_score():
     enrollment = platform_enrollment_payload(end_user["end_user_id"])
     threshold = float(data.get("threshold") or end_user.get("threshold") or 0.5)
 
+    score_started = time.perf_counter()
     score = None
     accepted = False
     reason = None
@@ -574,6 +1018,7 @@ def platform_score():
         except Exception as exc:
             app.logger.exception("platform model scoring failed")
             reason = f"scoring_failed: {exc}"
+    score_duration_ms = round((time.perf_counter() - score_started) * 1000, 3)
 
     request_payload = {
         "application_id": app_id,
@@ -587,6 +1032,7 @@ def platform_score():
         "enrollment_count": enrollment["enrollment_count"],
         "enrollment_required": enrollment["enrollment_required"],
         "reason": reason,
+        "score_duration_ms": score_duration_ms,
     }
     score_result = supabase.table("score_requests").insert(request_payload).execute()
 
@@ -606,9 +1052,12 @@ def platform_score():
         "end_user_id": end_user["end_user_id"],
         "external_user_id": external_user_id,
         "score": score,
+        "confidence": score,
         "accepted": accepted,
+        "match": accepted,
         "threshold": threshold,
         "reason": reason,
+        "score_duration_ms": score_duration_ms,
         **enrollment,
     })
 

@@ -49,12 +49,12 @@ The script:
    (TensorFlow makes this slow on first run).
 3. Runs `supabase init` / `supabase start`, falling back to
    `npx supabase` if the CLI is not installed globally.
-4. Applies `backend/schema.sql` to the local Postgres, using local
-   `psql` when available or the Supabase database container otherwise.
+4. Applies `backend/schema.sql` through `scripts/apply_schema.sh`, using
+   local `psql` when available or the Supabase database container otherwise.
 5. Writes `backend/.env` with the local Supabase URL + service-role
-   key, `CADENCE_DEMO_MODE=1`, and local frontend CORS origins, so 2FA
-   codes are returned in the API response (and shown in the UI banner)
-   instead of emailed.
+   key, `CADENCE_DEMO_MODE=1`, `CADENCE_ALLOW_OPEN_ADMIN=1`, and local
+   frontend CORS origins, so 2FA codes are returned in the API response
+   (and shown in the UI banner) instead of emailed.
 
 It's idempotent — safe to re-run after pulling.
 
@@ -85,6 +85,16 @@ npx supabase status             # same, if the CLI is not installed globally
 supabase stop                   # tear down the Docker stack
 supabase stop --no-backup       # nuke the local Postgres data too
 
+# apply the schema to local Supabase or a production Postgres URL
+DATABASE_URL=<postgres-url> bash scripts/apply_schema.sh
+
+# check the deployment folders are in sync before pushing them
+bash scripts/check_deployments_synced.sh
+
+# smoke-test a deployed platform API flow
+CADENCE_API_BASE=https://api.example.com CADENCE_ADMIN_TOKEN=<admin-token> \
+  python scripts/smoke_platform_api.py
+
 # inspect the local DB
 psql "$(supabase status -o env | sed -n 's/^DB_URL=//p' | tr -d '"')"
 
@@ -107,18 +117,98 @@ RESEND_KEY=<your resend api key>
 Free-tier Resend only delivers to the email tied to your Resend account
 until you verify a sending domain at <https://resend.com/domains>.
 
+For deployed environments, start from `backend/.env.example`. Production
+should set a stable `CADENCE_RSA_PRIVATE_KEY`, a non-empty
+`CADENCE_ADMIN_TOKEN`, real Resend credentials, explicit
+`CADENCE_CORS_ORIGINS`, and shared rate-limit storage through
+`CADENCE_RATE_LIMIT_STORAGE_URI` using a `redis://` or `rediss://` URL.
+Do not set
+`CADENCE_ALLOW_OPEN_ADMIN=1` outside local development.
+
+Deployment details for the Render backend, Vercel frontend, and sibling
+GitHub worktree sync are in `docs/deployment.md`.
+
+## Platform API quickstart
+
+Cadence can also run as a platform API for other applications. An
+operator creates an application, generates a server-side API key, and
+the integrating app sends typing samples captured by the npm package to
+`/v1/enroll` and `/v1/score`.
+
+Developers can submit an app-registration request through `/developer`
+or `submitAppRegistration`. Operators approve the request, which creates
+the application and returns the first `sk_live_...` key once. The
+submission response includes a one-time `reg_status_...` lookup token so
+the developer can check approval status without an admin token.
+
+```bash
+export CADENCE_ADMIN_TOKEN=<admin-token>
+
+curl -X POST "$CADENCE_API_BASE/v1/apps" \
+  -H "Authorization: Bearer $CADENCE_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Partner App","allowed_origins":["https://app.example.com"]}'
+
+curl -X POST "$CADENCE_API_BASE/v1/apps/<application_id>/api-keys" \
+  -H "Authorization: Bearer $CADENCE_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"production"}'
+```
+
+The Next.js frontend also includes `/developer`, an admin-token-gated
+console for the same app and key lifecycle. Set
+`NEXT_PUBLIC_SYNERGYZE_API_BASE` for the deployed API base, then open
+`/developer` and enter `CADENCE_ADMIN_TOKEN`.
+
+Use the generated `sk_live_...` key only from trusted server-side code.
+Browser code should use `createCapture` to collect a `Sample`, then post
+that sample to the application's own backend; that backend calls
+Cadence.
+
+```ts
+import { createCadenceClient } from '@cadence-auth/cadence';
+
+const cadence = createCadenceClient({
+  apiBaseUrl: process.env.CADENCE_API_BASE!,
+  apiKey: process.env.CADENCE_API_KEY!
+});
+
+await cadence.enroll({
+  external_user_id: user.id,
+  raw_data: sample,
+  quality_score: sample.quality_score,
+  flags: sample.flags
+});
+
+const result = await cadence.score({
+  external_user_id: user.id,
+  raw_data: sample
+});
+
+if (result.match) {
+  console.log('Typing matched with confidence', result.confidence);
+}
+```
+
+See `backend/ENDPOINTS.txt` for the full API notes,
+`packages/capture/README.md` for npm package usage, and
+`docs/release.md` for the production release and npm publishing
+checklist.
+
 ## Project layout details
 
 - **`backend/app.py`** — Flask routes for `/signup`, `/authenticate`,
   `/logout`, `/code_verification`, `/resend_code`, `/health`,
-  `/model/health`. See `backend/ENDPOINTS.txt` for the full contract.
+  `/model/health`, and the `/v1/*` platform API. See
+  `backend/ENDPOINTS.txt` for the full contract.
 - **`backend/model_service.py`** — wraps the Keras siamese model;
   fetches a user's prior successful samples from
   `public.login_attempts`, normalizes both sides, runs them through the
   twin towers, and returns the mean similarity.
-- **`packages/capture/`** — TypeScript/ESM browser library that
-  captures `keydown`/`keyup` timings into a `Sample` payload. The
-  frontend imports the prebuilt dist from `frontend/vendor/`.
+- **`packages/capture/`** — TypeScript/ESM package that captures
+  `keydown`/`keyup` timings into a `Sample` payload, extracts timing
+  features, and exposes a typed Cadence API client. The frontend imports
+  the prebuilt dist from `frontend/vendor/`.
 - **`frontend/`** — Next.js app with client-side routes
   (`/`, `/register`, `/login`, `/twofa`, `/dashboard`). Posts to
   `http://localhost:5001` by default; override with
