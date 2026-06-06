@@ -1084,10 +1084,17 @@ def signup():
         return jsonify({"status": "error", "message": "password must not contain your username"}), 400
 
     # check if username already exists
-    existing_user = supabase.table("user_profiles") \
-        .select("username") \
-        .eq("username", username) \
-        .execute()
+    try:
+        existing_user = supabase.table("user_profiles") \
+            .select("username") \
+            .eq("username", username) \
+            .execute()
+    except Exception as exc:
+        app.logger.exception("signup username lookup failed")
+        return jsonify({
+            "status": "error",
+            "message": f"could not check username availability: {exc}",
+        }), 502
     
     if existing_user.data:
         return jsonify({"status": "error", "message": "username already exists"}), 400
@@ -1128,14 +1135,26 @@ def signup():
         "number_login_attempts": 0
     })
     # create local user_profiles row for biometric login data
-    supabase.table("user_profiles").insert({
-        "user_id": user_id,
-        "username": username,
-        "email": email,
-        "threshold": 0.5,
-        "current_login_status": None,
-        "number_login_attempts": 0
-    }).execute()
+    try:
+        supabase.table("user_profiles").insert({
+            "user_id": user_id,
+            "username": username,
+            "email": email,
+            "threshold": 0.5,
+            "current_login_status": None,
+            "number_login_attempts": 0,
+            "failed_password_attempts": 0,
+        }).execute()
+    except Exception as exc:
+        app.logger.exception("signup profile insert failed for user_id=%s", user_id)
+        try:
+            supabase.auth.admin.delete_user(user_id)
+        except Exception:
+            app.logger.exception("signup rollback failed for user_id=%s", user_id)
+        return jsonify({
+            "status": "error",
+            "message": f"could not create user profile: {exc}",
+        }), 502
 
     return jsonify({"status": "signup_success", "user_id": user_id}), 200
 
