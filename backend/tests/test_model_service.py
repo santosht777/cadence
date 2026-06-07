@@ -64,6 +64,7 @@ def raw_keystrokes(length):
                 "hold_time": 80 + index % 5,
                 "flight_time": None if index == 0 else 40 + index % 7,
                 "down_down": None if index == 0 else 120 + index % 9,
+                "up_up": None if index == 0 else 120 + index % 11,
             }
         )
     return {"keystrokes": keystrokes}
@@ -75,7 +76,7 @@ class CadenceModelServiceTest(unittest.TestCase):
 
         for length in (6, 11, 14):
             model = service.model_for_length(length)
-            self.assertEqual(model.input_shape[0][1:], (length, 3))
+            self.assertEqual(model.input_shape[0][1:], (length, 4))
 
         self.assertEqual(service.health()["loaded_lengths"], [6, 11, 14])
 
@@ -128,8 +129,8 @@ class CadenceModelServiceTest(unittest.TestCase):
             sample,
             np.asarray(
                 [
-                    [50.0, 0.0, 0.0],
-                    [60.0, 30.0, 80.0],
+                    [50.0, 0.0, 0.0, 0.0],
+                    [60.0, 30.0, 80.0, 90.0],
                 ],
                 dtype="float32",
             ),
