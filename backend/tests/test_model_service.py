@@ -64,6 +64,7 @@ def raw_keystrokes(length):
                 "hold_time": 80 + index % 5,
                 "flight_time": None if index == 0 else 40 + index % 7,
                 "down_down": None if index == 0 else 120 + index % 9,
+                "up_up": None if index == 0 else 120 + index % 11,
             }
         )
     return {"keystrokes": keystrokes}
@@ -101,7 +102,7 @@ class CadenceModelServiceTest(unittest.TestCase):
 
         score = service.score_login_attempt(
             supabase,
-            "alice",
+            "user-alice",
             raw_data,
             login_attempt_id="current",
         )
@@ -139,7 +140,7 @@ class CadenceModelServiceTest(unittest.TestCase):
         service = CadenceModelService()
         score = service.score_login_attempt(
             FakeSupabase([]),
-            "alice",
+            "user-alice",
             raw_keystrokes(8),
             login_attempt_id="current",
         )

@@ -34,24 +34,15 @@ function isMobileDevice() {
          window.matchMedia('(pointer: coarse)').matches;
 }
 
-// Hash the password client-side before it ever leaves the browser.
-// This means a shoulder surfer watching the Network tab or a leaked request
-// log never sees the plaintext password. The hash is what Supabase stores
-// (then bcrypt-hashes again server-side), so it must be applied consistently
-// at both registration and login.
-async function hashPassword(plaintext) {
-  const encoded = new TextEncoder().encode(plaintext);
-  const buf = await crypto.subtle.digest('SHA-256', encoded);
-  return Array.from(new Uint8Array(buf))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+function hasSubtleCrypto() {
+  return typeof crypto !== 'undefined' && crypto.subtle;
 }
 
 // Convert a PEM string (-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----)
 // into a raw ArrayBuffer suitable for crypto.subtle.importKey.
 function pemToBuffer(pem) {
   // Strip literal \n sequences (Vercel env var mangling) as well as real
-  // whitespace before decoding — both can corrupt the base64 if left in.
+  // whitespace before decoding - both can corrupt the base64 if left in.
   const b64 = pem
     .replace(/\\n/g, '')
     .replace(/-----[^-]+-----/g, '')
@@ -97,7 +88,8 @@ function Enrollment({ payload }) {
   if (
     !payload ||
     typeof payload.enrollment_required !== 'number' ||
-    typeof payload.enrollment_count !== 'number'
+    typeof payload.enrollment_count !== 'number' ||
+    payload.enrolled
   ) {
     return null;
   }
@@ -145,6 +137,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
   const activeCaptureRef = useRef(null);
   const pendingAuthRef = useRef({ username: null, loginAttemptId: null });
   const rsaPublicKeyRef = useRef(null);
+
 
   const setStatus = useCallback((form, message, kind = '') => {
     setStatuses((current) => ({
@@ -237,7 +230,9 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     showView('dashboard');
   }, [showView]);
 
+
   useEffect(() => {
+    if (!hasSubtleCrypto()) return;
     fetch(`${getApiBase()}/public-key`)
       .then(r => r.json())
       .then(({ public_key }) => crypto.subtle.importKey(
@@ -248,6 +243,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       .then(key => { rsaPublicKeyRef.current = key; })
       .catch((err) => { console.error('RSA key import failed:', err); });
   }, []);
+
 
   useEffect(() => {
     const syncRoute = () => showView(readRouteFromLocation(), { replace: true });
@@ -266,7 +262,11 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     } else {
       teardownCapture();
     }
-    if (view !== 'twofa') setDemoOtp(null);
+    if (view === 'twofa') {
+      if (twofaCodeRef.current) twofaCodeRef.current.value = '';
+    } else {
+      setDemoOtp(null);
+    }
   }, [attachCapture, teardownCapture, view]);
 
   useEffect(() => teardownCapture, [teardownCapture]);
@@ -281,38 +281,9 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       setStatus('register', 'Please fill in every field.', 'error');
       return;
     }
-    // Policy checks must live here — once the password is hashed the server
-    // only sees a 64-char hex string and these conditions can never trigger.
-    if (password.length < 8) {
-      setStatus('register', 'Password must be at least 8 characters.', 'error');
-      return;
-    }
-    if (!/[A-Z]/.test(password)) {
-      setStatus('register', 'Password must contain at least one uppercase letter.', 'error');
-      return;
-    }
-    if (!/[a-z]/.test(password)) {
-      setStatus('register', 'Password must contain at least one lowercase letter.', 'error');
-      return;
-    }
-    if (!/[0-9]/.test(password)) {
-      setStatus('register', 'Password must contain at least one number.', 'error');
-      return;
-    }
-    if (!/[^A-Za-z0-9]/.test(password)) {
-      setStatus('register', 'Password must contain at least one special character.', 'error');
-      return;
-    }
-    if (password.toLowerCase().includes(username.toLowerCase())) {
-      setStatus('register', 'Password must not contain your username.', 'error');
-      return;
-    }
-
-    const hashedPassword = await hashPassword(password);
-
     setStatus('register', 'Disrupting the auth provider...');
     try {
-      const { ok, json } = await api('/signup', { email, username, password: hashedPassword });
+      const { ok, json } = await api('/signup', { email, username, password });
       if (json.status === 'signup_success') {
         setStatus('register', 'Account created. Redirecting to sign in...', 'success');
         window.setTimeout(() => {
@@ -356,22 +327,21 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       return;
     }
     const events = sample ? sample.events : [];
-    const hashedPassword = await hashPassword(password);
-
-    // Encrypt the keystroke events with the server's RSA public key before
-    // they leave the browser. An observer in dev tools sees only ciphertext —
-    // no timing values to copy or shift by a millisecond. The server decrypts
-    // before the replay-hash check and the model ever see the events.
-    if (!rsaPublicKeyRef.current) {
+    // Encrypt keystroke events when WebCrypto is available. Plain HTTP on a
+    // LAN/Tailscale IP is not a secure browser context, so local demo mode
+    // falls back to raw events; the backend accepts that only in demo mode.
+    if (hasSubtleCrypto() && !rsaPublicKeyRef.current) {
       setStatus('login', 'Encryption key not ready — please try again.', 'error');
       return;
     }
-    const raw_data = await encryptEvents(events, rsaPublicKeyRef.current);
+    const raw_data = hasSubtleCrypto()
+      ? await encryptEvents(events, rsaPublicKeyRef.current)
+      : { events };
     const is_mobile = isMobileDevice();
 
     setStatus('login', 'Analyzing your typing rhythm...');
     try {
-      const { json } = await api('/authenticate', { username, password: hashedPassword, raw_data, is_mobile });
+      const { json } = await api('/authenticate', { username, password, raw_data, is_mobile });
 
       switch (json.status) {
         case 'accepted':
@@ -503,7 +473,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       });
       if (json.status === 'code sent') {
         setDemoOtp(json.demo_otp || null);
-        setStatus('twofa', 'New code sent.', 'success');
+        setStatus('twofa', json.demo_otp ? 'New code generated.' : 'New code sent.', 'success');
       } else {
         setStatus('twofa', json.message || 'Could not resend.', 'error');
       }
@@ -830,8 +800,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   ref={loginPasswordRef}
                 />
                 <span className="field-hint">
-                  Type the way you always do. Cadence watches the rhythm, not the characters -
-                  Synergyze couldn't build this if we tried.
+                  Type the way you always do. Cadence watches the rhythm, not the characters.
                 </span>
               </label>
 
@@ -864,7 +833,11 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
           <div className="auth-card">
             <a className="auth-back" href="/login" onClick={routeTo('login')}>← back to sign in</a>
             <h1 className="auth-title">Verify it's you</h1>
-            <p className="auth-sub">We sent a 6-digit code to your email. It's good for 5 minutes.</p>
+            <p className="auth-sub">
+              {demoOtp
+                ? "Use the 6-digit code shown below. It's good for 5 minutes."
+                : "We sent a 6-digit code to your email. It's good for 5 minutes."}
+            </p>
             <p className="auth-sub">Don't worry - we don't care how you type this part.</p>
 
             <div className="demo-banner" id="demo-banner" hidden={!demoOtp}>
@@ -898,7 +871,9 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
               <Status value={statuses.twofa} />
 
               <p className="auth-switch">
-                Didn't get it? <a href="#" id="twofa-resend" onClick={handleResend}>Resend code</a>
+                Need another one? <a href="#" id="twofa-resend" onClick={handleResend}>
+                  {demoOtp ? 'Generate code' : 'Resend code'}
+                </a>
               </p>
             </form>
           </div>
@@ -911,14 +886,6 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
 
             <Enrollment payload={enrollment} />
 
-            <div className="auth-aside">
-              <p className="aside-eyebrow">What now?</p>
-              <ul>
-                <li>Forward your salary to a Substack</li>
-                <li>Pivot, but quietly</li>
-                <li>Sign out and tell a friend (please)</li>
-              </ul>
-            </div>
 
             <button type="button" className="btn btn-ghost btn-block" id="logout-btn" onClick={handleLogout}>
               Sign out

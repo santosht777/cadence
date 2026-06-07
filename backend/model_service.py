@@ -43,6 +43,7 @@ class CadenceModelService:
         self._models = {}
         self._mean = None
         self._std = None
+        self._feature_order = None
 
     def health(self):
         return {
@@ -56,20 +57,20 @@ class CadenceModelService:
     def score_login_attempt(
         self,
         supabase,
-        username,
+        user_id,
         raw_data,
         login_attempt_id=None,
     ):
         try:
             current_sample = self.raw_data_to_sample(raw_data)
             enrollment_samples = self.fetch_enrollment_samples(
-                supabase, username, login_attempt_id
+                supabase, user_id, login_attempt_id
             )
             if not enrollment_samples:
                 return None
             return self.score_against_enrollment(current_sample, enrollment_samples)
         except Exception:
-            logger.exception("Model scoring failed for username=%s", username)
+            logger.exception("Model scoring failed for user_id=%s", user_id)
             return None
 
     def score_against_enrollment(self, current_sample, enrollment_samples):
@@ -91,11 +92,11 @@ class CadenceModelService:
         scores = result.numpy().reshape(-1)
         return float(np.mean(scores))
 
-    def fetch_enrollment_samples(self, supabase, username, login_attempt_id=None):
+    def fetch_enrollment_samples(self, supabase, user_id, login_attempt_id=None):
         query = (
             supabase.table("login_attempts")
             .select("login_attempt_id, raw_data")
-            .eq("username", username)
+            .eq("user_id", user_id)
             .eq("successful_login", True)
             .order("login_number", desc=True)
             .limit(self.enrollment_limit)
@@ -119,6 +120,17 @@ class CadenceModelService:
         normalization = metrics["normalization"]
         self._mean = np.asarray(normalization["mean"], dtype="float32")
         self._std = np.asarray(normalization["std"], dtype="float32")
+        self._feature_order = normalization.get("feature_order") or [
+            "hold_time",
+            "flight_time",
+            "down_down",
+        ]
+        if len(self._feature_order) != len(self._mean):
+            raise ValueError("normalization feature_order length must match mean/std")
+
+    def feature_order(self):
+        self.load_normalization()
+        return self._feature_order
 
     def model_for_length(self, input_length):
         if input_length <= 0:
@@ -130,7 +142,8 @@ class CadenceModelService:
             sys.path.insert(0, str(REPO_ROOT))
         from model import build_cadence_model
 
-        model = build_cadence_model(input_shape=(input_length, 3))
+        self.load_normalization()
+        model = build_cadence_model(input_shape=(input_length, len(self._mean)))
         model.load_weights(self.model_path)
         self._models[input_length] = model
         return model
@@ -138,13 +151,15 @@ class CadenceModelService:
     def prepare_sample(self, sample, target_length):
         self.load_normalization()
         sample = np.asarray(sample, dtype="float32")
-        if sample.ndim != 2 or sample.shape[1] != 3:
-            raise ValueError("typing sample must have shape (timesteps, 3)")
+        if sample.ndim != 2 or sample.shape[1] != len(self._mean):
+            raise ValueError(
+                f"typing sample must have shape (timesteps, {len(self._mean)})"
+            )
 
         sample = (sample - self._mean) / self._std
         sample = sample[:target_length]
 
-        padded = np.zeros((target_length, 3), dtype="float32")
+        padded = np.zeros((target_length, len(self._mean)), dtype="float32")
         padded[: len(sample)] = sample
         return padded
 
@@ -164,14 +179,9 @@ class CadenceModelService:
 
     def keystrokes_to_sample(self, keystrokes):
         sample = []
+        feature_order = self.feature_order()
         for key in keystrokes:
-            sample.append(
-                [
-                    float(key.get("hold_time") or 0.0),
-                    float(key.get("flight_time") or 0.0),
-                    float(key.get("down_down") or 0.0),
-                ]
-            )
+            sample.append([float(key.get(feature) or 0.0) for feature in feature_order])
         if not sample:
             raise ValueError("keystrokes cannot be empty")
         return np.asarray(sample, dtype="float32")
@@ -208,7 +218,14 @@ class CadenceModelService:
             down_down = (
                 current["down_t"] - previous["down_t"] if previous else 0.0
             )
-            sample.append([hold_time, flight_time, down_down])
+            up_up = current["up_t"] - previous["up_t"] if previous else 0.0
+            features = {
+                "hold_time": hold_time,
+                "flight_time": flight_time,
+                "down_down": down_down,
+                "up_up": up_up,
+            }
+            sample.append([features[feature] for feature in self.feature_order()])
 
         if not sample:
             raise ValueError("events did not contain any complete key pairs")
