@@ -1288,7 +1288,7 @@ def authenticate():
 
     # get the score from ML engine 
     score = get_score(username, raw_data, login_attempt_id)
-    print(score)
+    app.logger.info("score: %s", score)
     
     # if no score available, treat as low confidence and trigger 2FA
     if score == None:
