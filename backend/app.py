@@ -1166,6 +1166,7 @@ def signup():
 @app.post("/authenticate")
 @limiter.limit("10 per minute; 50 per hour")
 def authenticate():
+    print("entering authenticate endpoint", flush=True)
     data = request.json
     username = data.get("username")
     password = data.get("password")
@@ -1290,6 +1291,7 @@ def authenticate():
     # get the score from ML engine 
     score = get_score(username, raw_data, login_attempt_id)
     app.logger.info("score: %s", score)
+    print("score =", score, flush=True)
     
     # if no score available, treat as low confidence and trigger 2FA
     if score == None:
