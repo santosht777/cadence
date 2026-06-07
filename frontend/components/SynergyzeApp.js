@@ -35,46 +35,6 @@ function isMobileDevice() {
 }
 
 // Hash the password client-side before it ever leaves the browser.
-// Convert a PEM string (-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----)
-// into a raw ArrayBuffer suitable for crypto.subtle.importKey.
-function pemToBuffer(pem) {
-  // Strip literal \n sequences (Vercel env var mangling) as well as real
-  // whitespace before decoding — both can corrupt the base64 if left in.
-  const b64 = pem
-    .replace(/\\n/g, '')
-    .replace(/-----[^-]+-----/g, '')
-    .replace(/\s+/g, '');
-  const binary = atob(b64);
-  const buf = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
-  return buf.buffer;
-}
-
-// Hybrid RSA-OAEP + AES-256-GCM encryption.
-// RSA alone can't encrypt arbitrary-length data, so we generate an ephemeral
-// AES key per request, encrypt the events JSON with it, then wrap the AES key
-// with the server's RSA public key. Only the server's private key can unwrap it.
-async function encryptEvents(events, rsaCryptoKey) {
-  const aesKey = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 }, true, ['encrypt']
-  );
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    new TextEncoder().encode(JSON.stringify(events))
-  );
-  const rawAesKey = await crypto.subtle.exportKey('raw', aesKey);
-  const encryptedKey = await crypto.subtle.encrypt(
-    { name: 'RSA-OAEP' }, rsaCryptoKey, rawAesKey
-  );
-  const toB64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
-  return {
-    encrypted_key: toB64(encryptedKey),
-    iv:            toB64(iv),
-    ciphertext:    toB64(ciphertext),
-  };
-}
 
 function Status({ value }) {
   const kind = value?.kind ? ` is-${value.kind}` : '';
@@ -157,7 +117,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
   const developerStatusTokenRef = useRef(null);
   const activeCaptureRef = useRef(null);
   const pendingAuthRef = useRef({ username: null, loginAttemptId: null });
-  const rsaPublicKeyRef = useRef(null);
+
 
   const setStatus = useCallback((form, message, kind = '') => {
     setStatuses((current) => ({
@@ -369,17 +329,6 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     showView('dashboard');
   }, [showView]);
 
-  useEffect(() => {
-    fetch(`${getApiBase()}/public-key`)
-      .then(r => r.json())
-      .then(({ public_key }) => crypto.subtle.importKey(
-        'spki', pemToBuffer(public_key),
-        { name: 'RSA-OAEP', hash: 'SHA-256' },
-        false, ['encrypt']
-      ))
-      .then(key => { rsaPublicKeyRef.current = key; })
-      .catch((err) => { console.error('RSA key import failed:', err); });
-  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -698,14 +647,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     }
     const events = sample ? sample.events : [];
     // Encrypt the keystroke events with the server's RSA public key before
-    // they leave the browser. An observer in dev tools sees only ciphertext —
-    // no timing values to copy or shift by a millisecond. The server decrypts
-    // before the replay-hash check and the model ever see the events.
-    if (!rsaPublicKeyRef.current) {
-      setStatus('login', 'Encryption key not ready — please try again.', 'error');
-      return;
-    }
-    const raw_data = await encryptEvents(events, rsaPublicKeyRef.current);
+    const raw_data = { events };
     const is_mobile = isMobileDevice();
 
     setStatus('login', 'Analyzing your typing rhythm...');
