@@ -1341,6 +1341,7 @@ def authenticate():
 
 @app.post("/logout")
 def logout():
+    print("entering logout endpoint", flush=True)
     data = request.json or {}
     username = data.get("username")
 
