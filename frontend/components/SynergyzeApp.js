@@ -35,18 +35,6 @@ function isMobileDevice() {
 }
 
 // Hash the password client-side before it ever leaves the browser.
-// This means a shoulder surfer watching the Network tab or a leaked request
-// log never sees the plaintext password. The hash is what Supabase stores
-// (then bcrypt-hashes again server-side), so it must be applied consistently
-// at both registration and login.
-async function hashPassword(plaintext) {
-  const encoded = new TextEncoder().encode(plaintext);
-  const buf = await crypto.subtle.digest('SHA-256', encoded);
-  return Array.from(new Uint8Array(buf))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
 // Convert a PEM string (-----BEGIN PUBLIC KEY----- ... -----END PUBLIC KEY-----)
 // into a raw ArrayBuffer suitable for crypto.subtle.importKey.
 function pemToBuffer(pem) {
@@ -663,38 +651,9 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       setStatus('register', 'Please fill in every field.', 'error');
       return;
     }
-    // Policy checks must live here — once the password is hashed the server
-    // only sees a 64-char hex string and these conditions can never trigger.
-    if (password.length < 8) {
-      setStatus('register', 'Password must be at least 8 characters.', 'error');
-      return;
-    }
-    if (!/[A-Z]/.test(password)) {
-      setStatus('register', 'Password must contain at least one uppercase letter.', 'error');
-      return;
-    }
-    if (!/[a-z]/.test(password)) {
-      setStatus('register', 'Password must contain at least one lowercase letter.', 'error');
-      return;
-    }
-    if (!/[0-9]/.test(password)) {
-      setStatus('register', 'Password must contain at least one number.', 'error');
-      return;
-    }
-    if (!/[^A-Za-z0-9]/.test(password)) {
-      setStatus('register', 'Password must contain at least one special character.', 'error');
-      return;
-    }
-    if (password.toLowerCase().includes(username.toLowerCase())) {
-      setStatus('register', 'Password must not contain your username.', 'error');
-      return;
-    }
-
-    const hashedPassword = await hashPassword(password);
-
     setStatus('register', 'Disrupting the auth provider...');
     try {
-      const { ok, json } = await api('/signup', { email, username, password: hashedPassword });
+      const { ok, json } = await api('/signup', { email, username, password });
       if (json.status === 'signup_success') {
         setStatus('register', 'Account created. Redirecting to sign in...', 'success');
         window.setTimeout(() => {
@@ -738,8 +697,6 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
       return;
     }
     const events = sample ? sample.events : [];
-    const hashedPassword = await hashPassword(password);
-
     // Encrypt the keystroke events with the server's RSA public key before
     // they leave the browser. An observer in dev tools sees only ciphertext —
     // no timing values to copy or shift by a millisecond. The server decrypts
@@ -753,7 +710,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
 
     setStatus('login', 'Analyzing your typing rhythm...');
     try {
-      const { json } = await api('/authenticate', { username, password: hashedPassword, raw_data, is_mobile });
+      const { json } = await api('/authenticate', { username, password, raw_data, is_mobile });
 
       switch (json.status) {
         case 'accepted':

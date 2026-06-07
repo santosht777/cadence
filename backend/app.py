@@ -1077,12 +1077,20 @@ def signup():
         return jsonify({"status": "error", "message": "missing email"}), 400
     if not password:
         return jsonify({"status": "error", "message": "missing password"}), 400
-    if len(password) < 8:
-        return jsonify({"status": "error", "message": "password must be at least 8 characters"}), 400
     if not username:
         return jsonify({"status": "error", "message": "missing username"}), 400
+    if len(password) < 16:
+        return jsonify({"status": "error", "message": "Password must be at least 16 characters."}), 400
+    if not re.search(r'[A-Z]', password):
+        return jsonify({"status": "error", "message": "Password must contain at least one uppercase letter."}), 400
+    if not re.search(r'[a-z]', password):
+        return jsonify({"status": "error", "message": "Password must contain at least one lowercase letter."}), 400
+    if not re.search(r'[0-9]', password):
+        return jsonify({"status": "error", "message": "Password must contain at least one number."}), 400
+    if not re.search(r'[^A-Za-z0-9]', password):
+        return jsonify({"status": "error", "message": "Password must contain at least one special character."}), 400
     if username.lower() in password.lower():
-        return jsonify({"status": "error", "message": "password must not contain your username"}), 400
+        return jsonify({"status": "error", "message": "Password must not contain your username."}), 400
 
     # check if username already exists
     try:
