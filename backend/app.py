@@ -1632,7 +1632,7 @@ def _hash_events(raw_data):
     # Canonicalize the events array (sort_keys so key ordering can't create
     # two different hashes for the same payload) and return its SHA-256 digest.
     # Returns None when there are no events so callers can skip the DB check.
-    events = (raw_data or {}).get("events") or []
+    events = (raw_data.get("events") if isinstance(raw_data, dict) else raw_data) or []  # FIX: handle list vs dict
     if not events:
         return None
     canonical = json.dumps(events, sort_keys=True, separators=(',', ':'))
