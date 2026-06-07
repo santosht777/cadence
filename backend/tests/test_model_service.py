@@ -76,7 +76,7 @@ class CadenceModelServiceTest(unittest.TestCase):
 
         for length in (6, 11, 14):
             model = service.model_for_length(length)
-            self.assertEqual(model.input_shape[0][1:], (length, 4))
+            self.assertEqual(model.input_shape[0][1:], (length, 3))
 
         self.assertEqual(service.health()["loaded_lengths"], [6, 11, 14])
 
@@ -129,8 +129,8 @@ class CadenceModelServiceTest(unittest.TestCase):
             sample,
             np.asarray(
                 [
-                    [50.0, 0.0, 0.0, 0.0],
-                    [60.0, 30.0, 80.0, 90.0],
+                    [50.0, 0.0, 0.0],
+                    [60.0, 30.0, 80.0],
                 ],
                 dtype="float32",
             ),

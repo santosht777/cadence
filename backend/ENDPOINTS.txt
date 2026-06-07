@@ -66,7 +66,7 @@ raw_data Format (either):
 - List of keystroke objects:
   {
     "keystrokes": [
-      {"hold_time": float, "flight_time": float, "down_down": float, "up_up": float},
+      {"hold_time": float, "flight_time": float, "down_down": float},
       ...
     ]
   }
@@ -509,7 +509,7 @@ Request Body:
 }
 
 raw_data may also be {"keystrokes": [...]} or a bare list of keystroke
-objects with hold_time, flight_time, down_down, and up_up.
+objects with the timing fields named by the active model metrics file.
 
 Response:
 {
@@ -673,7 +673,7 @@ are rejected and the account is locked.
 
 ML Model Requirements:
 - Input: Keystroke sequences with timing features from the model metrics file.
-  The current base model uses [hold_time, flight_time, down_down, up_up].
+  The current CMU base model uses [hold_time, flight_time, down_down].
 - Output: Similarity score between 0.0 and 1.0 (higher = more similar to enrollment)
 - Enrollment: Requires 5 successful login attempts before biometric-only login
 - Threshold: Retrieved from user_profiles table for each user
