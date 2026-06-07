@@ -1606,7 +1606,7 @@ _MIN_STDDEV_INTERVAL_MS = float(os.getenv("CADENCE_MIN_STDDEV_INTERVAL_MS", "8")
 def _is_scripted_typing(raw_data):
     # Extract timestamps of keydown events only (down-to-down intervals are
     # the standard measure of typing speed and rhythm).
-    events = (raw_data or {}).get("events") or []
+    events = (raw_data.get("events") if isinstance(raw_data, dict) else raw_data) or []  # FIX: handle list vs dict
     down_times = [e["t"] for e in events if e.get("type") == "down"]
 
     # Need at least 3 intervals to compute a meaningful standard deviation.
