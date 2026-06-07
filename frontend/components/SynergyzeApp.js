@@ -45,7 +45,8 @@ function Enrollment({ payload }) {
   if (
     !payload ||
     typeof payload.enrollment_required !== 'number' ||
-    typeof payload.enrollment_count !== 'number'
+    typeof payload.enrollment_count !== 'number' ||
+    payload.enrolled
   ) {
     return null;
   }
@@ -1519,8 +1520,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
                   ref={loginPasswordRef}
                 />
                 <span className="field-hint">
-                  Type the way you always do. Cadence watches the rhythm, not the characters -
-                  Synergyze couldn't build this if we tried.
+                  Type the way you always do. Cadence watches the rhythm, not the characters.
                 </span>
               </label>
 
@@ -1600,14 +1600,6 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
 
             <Enrollment payload={enrollment} />
 
-            <div className="auth-aside">
-              <p className="aside-eyebrow">What now?</p>
-              <ul>
-                <li>Forward your salary to a Substack</li>
-                <li>Pivot, but quietly</li>
-                <li>Sign out and tell a friend (please)</li>
-              </ul>
-            </div>
 
             <button type="button" className="btn btn-ghost btn-block" id="logout-btn" onClick={handleLogout}>
               Sign out
