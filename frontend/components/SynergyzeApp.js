@@ -246,7 +246,7 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
         false, ['encrypt']
       ))
       .then(key => { rsaPublicKeyRef.current = key; })
-      .catch(() => {});
+      .catch((err) => { console.error('RSA key import failed:', err); });
   }, []);
 
   useEffect(() => {
