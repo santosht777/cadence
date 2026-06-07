@@ -4,7 +4,6 @@ import os
 import random
 import hashlib
 import json
-import base64
 import hmac
 import re
 import resend
@@ -13,9 +12,6 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 import secrets
 import uuid
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives import hashes, serialization
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -125,27 +121,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY").strip()
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase_auth = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
-# ---------------------------------------------------------------------------
-# RSA keypair for encrypting keystroke events in transit.
-# In production, set CADENCE_RSA_PRIVATE_KEY to a PEM-encoded private key so
-# the same key survives restarts and can be rotated deliberately. In dev/demo
-# mode a fresh ephemeral key is generated at startup.
-# ---------------------------------------------------------------------------
-_raw_pem = os.getenv("CADENCE_RSA_PRIVATE_KEY")
-if _raw_pem:
-    _RSA_PRIVATE_KEY = serialization.load_pem_private_key(
-        _raw_pem.strip().encode(), password=None
-    )
-else:
-    _RSA_PRIVATE_KEY = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048
-    )
-
-_RSA_PUBLIC_KEY_PEM = _RSA_PRIVATE_KEY.public_key().public_bytes(
-    serialization.Encoding.PEM,
-    serialization.PublicFormat.SubjectPublicKeyInfo,
-).decode()
 
 
 def _supabase_sign_up(email, password):
@@ -534,6 +509,19 @@ def count_successful_login_attempts(user_id):
     return len(result.data or [])
 
 
+def _increment_successful_logins(user_id):
+    profile = supabase.table("user_profiles") \
+        .select("number_of_successful_logins") \
+        .eq("user_id", user_id) \
+        .single() \
+        .execute()
+    current = (profile.data or {}).get("number_of_successful_logins") or 0
+    supabase.table("user_profiles") \
+        .update({"number_of_successful_logins": current + 1}) \
+        .eq("user_id", user_id) \
+        .execute()
+
+
 def enrollment_payload(enrollment_count):
     samples_needed = max(REQUIRED_ENROLLMENT_SAMPLES - enrollment_count, 0)
     return {
@@ -544,7 +532,7 @@ def enrollment_payload(enrollment_count):
     }
 
 
-def require_2fa(user_id, username, login_attempt_id, enrollment_count, reason):
+def require_2fa(user_id, login_attempt_id, enrollment_count, reason):
     supabase.table("user_profiles") \
         .update({"current_login_status": "pending 2fa"}) \
         .eq("user_id", user_id) \
@@ -559,7 +547,7 @@ def require_2fa(user_id, username, login_attempt_id, enrollment_count, reason):
     # test mode), roll back the pending state so the user can retry
     # instead of getting wedged into "previous login still pending".
     try:
-        otp = send_code(user_id, username, login_attempt_id)
+        otp = send_code(user_id, login_attempt_id)
     except Exception as exc:
         app.logger.exception("send_code failed; rolling back pending 2fa")
         supabase.table("user_profiles") \
@@ -597,39 +585,6 @@ def model_health():
     return jsonify(model_service.health())
 
 
-@app.get("/public-key")
-def public_key():
-    # Vends the RSA public key so the frontend can encrypt keystroke events
-    # before they leave the browser. The private key never leaves the server,
-    # so a dev-tools observer only ever sees ciphertext - no raw timing values
-    # to copy or tweak by a millisecond.
-    return jsonify({"public_key": _RSA_PUBLIC_KEY_PEM}), 200
-
-
-def _decrypt_events(raw_data):
-    if DEMO_MODE and isinstance(raw_data, dict) and "events" in raw_data:
-        return raw_data
-    if DEMO_MODE and isinstance(raw_data, list):
-        return {"events": raw_data}
-
-    # Expects raw_data = { encrypted_key, iv, ciphertext } (all base64).
-    # 1. Unwrap the per-request AES key with our RSA private key (OAEP-SHA256).
-    # 2. Decrypt the events JSON with AES-256-GCM.
-    # Returns the plaintext { events: [...] } dict, or raises on any failure.
-    enc_key = base64.b64decode(raw_data["encrypted_key"])
-    iv      = base64.b64decode(raw_data["iv"])
-    ct      = base64.b64decode(raw_data["ciphertext"])
-
-    aes_key = _RSA_PRIVATE_KEY.decrypt(
-        enc_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
-    plaintext = AESGCM(aes_key).decrypt(iv, ct, None)
-    return json.loads(plaintext)
 
 
 @app.post("/v1/apps")
@@ -1168,6 +1123,7 @@ def signup():
             "current_login_status": None,
             "number_login_attempts": 0,
             "failed_password_attempts": 0,
+            "number_of_successful_logins": 0,
         }).execute()
     except Exception as exc:
         app.logger.exception("signup profile insert failed for user_id=%s", user_id)
@@ -1205,11 +1161,6 @@ def authenticate():
 
     if raw_data is None:
         return jsonify({"status": "error", "message": "missing raw_data"}), 400
-
-    try:
-        raw_data = _decrypt_events(raw_data)
-    except Exception:
-        return jsonify({"status": "error", "message": "invalid keystroke payload"}), 400
 
     # Reject suspiciously uniform or impossibly fast keystroke sequences.
     # Matches the same message as the paste check so automated tooling gets
@@ -1266,7 +1217,7 @@ def authenticate():
         # Wrong password: increment the failure counter and, if the threshold
         # is reached, lock the account and email an unlock code to the owner.
         lock_info = _handle_failed_password(
-            user_id, username,
+            user_id,
             user_profile.get("failed_password_attempts", 0),
         )
         if lock_info:
@@ -1285,14 +1236,13 @@ def authenticate():
 
     # create new login attempt w user info
     enrollment_count = count_successful_login_attempts(user_id)
-    login_attempt_id = create_login_attempt(supabase, user_id, username, raw_data, events_hash=events_hash)
+    login_attempt_id = create_login_attempt(supabase, user_id, raw_data, events_hash=events_hash)
     if login_attempt_id == None:
         return jsonify({"status": "can't verify login"}), 200
 
     if enrollment_count < REQUIRED_ENROLLMENT_SAMPLES:
         return require_2fa(
             user_id,
-            username,
             login_attempt_id,
             enrollment_count,
             "enrollment_required",
@@ -1303,7 +1253,6 @@ def authenticate():
     if is_mobile:
         return require_2fa(
             user_id,
-            username,
             login_attempt_id,
             enrollment_count,
             "mobile_device",
@@ -1340,7 +1289,9 @@ def authenticate():
             .update({"current_login_status": "logged in", "failed_password_attempts": 0}) \
             .eq("user_id", user_id) \
             .execute()
-            
+
+        _increment_successful_logins(user_id)
+
         return jsonify({
             "status": "accepted",
             **enrollment_payload(enrollment_count),
@@ -1348,7 +1299,6 @@ def authenticate():
     else:
         return require_2fa(
             user_id,
-            username,
             login_attempt_id,
             enrollment_count,
             "low_confidence",
@@ -1385,14 +1335,10 @@ def logout():
 @app.post("/code_verification")
 def code_verification():
     data = request.json
-    username = data.get("username")
     code = data.get("code")
     login_attempt_id = data.get("login_attempt_id")
 
-    # error handling 
-    if not username:
-        return jsonify({"status": "error", "message": "missing username"}), 400
-
+    # error handling
     if not code:
         return jsonify({"status": "error", "message": "missing code"}), 400
 
@@ -1494,6 +1440,8 @@ def code_verification():
         .eq("user_id", user_id) \
         .execute()
 
+    _increment_successful_logins(user_id)
+
     return jsonify({
         "status": "accepted",
         **enrollment_payload(enrollment_count),
@@ -1503,13 +1451,9 @@ def code_verification():
 @app.post("/resend_code")
 def resend_code():
     data = request.json
-    username = data.get("username")
     login_attempt_id = data.get("login_attempt_id")
 
     # error handling
-    if not username:
-        return jsonify({"status": "error", "message": "missing username"}), 400
-
     if not login_attempt_id:
         return jsonify({"status": "error", "message": "missing login_attempt_id"}), 400
 
@@ -1563,7 +1507,7 @@ def resend_code():
     email = email_result.data[0]["email"]
 
     if DEMO_MODE:
-        app.logger.warning("[DEMO_MODE] resent OTP for %s (%s): %s", username, email, otp)
+        app.logger.warning("[DEMO_MODE] resent OTP for user_id=%s (%s): %s", user_id, email, otp)
         return jsonify({"status": "code sent", "demo_otp": otp}), 200
 
     resend.api_key = os.getenv("RESEND_KEY")
@@ -1580,7 +1524,7 @@ def resend_code():
 # Brute-force protection helpers
 # ---------------------------------------------------------------------------
 
-def _handle_failed_password(user_id, username, current_failures):
+def _handle_failed_password(user_id, current_failures):
     # Increment the consecutive wrong-password counter.
     # If the threshold is reached, send an unlock code and set the account to
     # "password_locked" so no further login attempts can proceed until the user
@@ -1600,11 +1544,11 @@ def _handle_failed_password(user_id, username, current_failures):
     # record (send_code requires a login_attempt_id with a matching row),
     # then send the unlock code. If sending fails we leave the account
     # unlocked rather than stranding the user with no way to recover.
-    unlock_attempt_id = create_login_attempt(supabase, user_id, username, {})
+    unlock_attempt_id = create_login_attempt(supabase, user_id, {})
     try:
-        otp = send_code(user_id, username, unlock_attempt_id)
+        otp = send_code(user_id, unlock_attempt_id)
     except Exception:
-        app.logger.exception("send_code failed during password-lock for %s", username)
+        app.logger.exception("send_code failed during password-lock for user_id=%s", user_id)
         return None
 
     supabase.table("user_profiles") \
@@ -1687,7 +1631,7 @@ def _is_replayed_payload(user_id, events_hash):
 
 
 # create new login attempt in DB, return login attempt id
-def create_login_attempt(supabase, user_id, username, raw_data, events_hash=None):
+def create_login_attempt(supabase, user_id, raw_data, events_hash=None):
     login_attempt_id = str(uuid.uuid4())
      # 1. fetch profile
     profile = (
@@ -1736,7 +1680,7 @@ def get_score(user_id, raw_data, login_attempt_id=None):
 
 # generate otp hash, send code to user's email. Returns the plaintext
 # OTP so the caller can surface it in demo mode.
-def send_code(user_id, username, login_attempt_id):
+def send_code(user_id, login_attempt_id):
     email_result = supabase.table("user_profiles") \
         .select("email") \
         .eq("user_id", user_id) \
@@ -1759,7 +1703,6 @@ def send_code(user_id, username, login_attempt_id):
         .insert({
             "login_attempt_id": login_attempt_id,
             "user_id": user_id,
-            "username": username,
             "otp_hash": otp_hash,
             "expires_at": expires_at.isoformat(),
             "attempt_count": 0
@@ -1767,7 +1710,7 @@ def send_code(user_id, username, login_attempt_id):
         .execute()
 
     if DEMO_MODE:
-        app.logger.warning("[DEMO_MODE] OTP for %s (%s): %s", username, email, otp)
+        app.logger.warning("[DEMO_MODE] OTP for user_id=%s (%s): %s", user_id, email, otp)
         return otp
 
     resend.api_key = os.getenv("RESEND_KEY")
