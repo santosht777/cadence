@@ -355,7 +355,11 @@ export default function SynergyzeApp({ initialRoute = 'landing' }) {
     } else {
       teardownCapture();
     }
-    if (view !== 'twofa') setDemoOtp(null);
+    if (view === 'twofa') {
+      if (twofaCodeRef.current) twofaCodeRef.current.value = '';
+    } else {
+      setDemoOtp(null);
+    }
   }, [attachCapture, teardownCapture, view]);
 
   useEffect(() => teardownCapture, [teardownCapture]);
