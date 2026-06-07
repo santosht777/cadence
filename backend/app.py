@@ -31,6 +31,7 @@ except ImportError:
     from model_service import CadenceModelService
 
 app = Flask(__name__)
+app.logger.setLevel("INFO")
 # Trust one level of X-Forwarded-For so the rate limiter sees the real
 # client IP rather than the hosting platform's proxy address.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
@@ -1165,6 +1166,7 @@ def signup():
 @app.post("/authenticate")
 @limiter.limit("10 per minute; 50 per hour")
 def authenticate():
+    print("entering authenticate endpoint", flush=True)
     data = request.json
     username = data.get("username")
     password = data.get("password")
@@ -1288,7 +1290,8 @@ def authenticate():
 
     # get the score from ML engine 
     score = get_score(username, raw_data, login_attempt_id)
-    print(score)
+    app.logger.info("score: %s", score)
+    print("score =", score, flush=True)
     
     # if no score available, treat as low confidence and trigger 2FA
     if score == None:
@@ -1306,6 +1309,7 @@ def authenticate():
                 .eq("user_id", user_id) \
                 .execute()
     threshold = threshold_result.data[0]["threshold"]
+    app.logger.info("threshold: %s", threshold)
 
     # check it
     if (score >= threshold):
@@ -1337,6 +1341,7 @@ def authenticate():
 
 @app.post("/logout")
 def logout():
+    print("entering logout endpoint", flush=True)
     data = request.json or {}
     username = data.get("username")
 
@@ -1606,7 +1611,7 @@ _MIN_STDDEV_INTERVAL_MS = float(os.getenv("CADENCE_MIN_STDDEV_INTERVAL_MS", "8")
 def _is_scripted_typing(raw_data):
     # Extract timestamps of keydown events only (down-to-down intervals are
     # the standard measure of typing speed and rhythm).
-    events = (raw_data or {}).get("events") or []
+    events = (raw_data.get("events") if isinstance(raw_data, dict) else raw_data) or []  # FIX: handle list vs dict
     down_times = [e["t"] for e in events if e.get("type") == "down"]
 
     # Need at least 3 intervals to compute a meaningful standard deviation.
@@ -1632,7 +1637,7 @@ def _hash_events(raw_data):
     # Canonicalize the events array (sort_keys so key ordering can't create
     # two different hashes for the same payload) and return its SHA-256 digest.
     # Returns None when there are no events so callers can skip the DB check.
-    events = (raw_data or {}).get("events") or []
+    events = (raw_data.get("events") if isinstance(raw_data, dict) else raw_data) or []  # FIX: handle list vs dict
     if not events:
         return None
     canonical = json.dumps(events, sort_keys=True, separators=(',', ':'))
