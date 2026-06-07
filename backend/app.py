@@ -4,7 +4,6 @@ import os
 import random
 import hashlib
 import json
-import base64
 import hmac
 import re
 import resend
@@ -96,6 +95,7 @@ def cors_preflight(_any=None):
 REQUIRED_ENROLLMENT_SAMPLES = int(
     os.getenv("CADENCE_REQUIRED_ENROLLMENT_SAMPLES", "5")
 )
+DEFAULT_THRESHOLD = 0.70
 ADMIN_TOKEN = os.getenv("CADENCE_ADMIN_TOKEN", "").strip()
 ALLOW_OPEN_ADMIN = os.getenv("CADENCE_ALLOW_OPEN_ADMIN", "0").lower() in {"1", "true", "yes"}
 API_KEY_PREFIX_LENGTH = 18
@@ -292,6 +292,7 @@ def create_application_record(data):
         "name": name,
         "slug": slugify(data.get("slug") or name),
         "allowed_origins": allowed_origins,
+        "threshold": float(data.get("threshold") or DEFAULT_THRESHOLD),
     }
     contact_email = (data.get("contact_email") or "").strip()
     if contact_email:
@@ -307,7 +308,7 @@ def create_application_record(data):
     return result.data[0], None
 
 
-def get_or_create_end_user(application_id, external_user_id, threshold=None, metadata=None):
+def get_or_create_end_user(application_id, external_user_id, metadata=None):
     query = supabase.table("end_users") \
         .select("*") \
         .eq("application_id", application_id) \
@@ -322,8 +323,6 @@ def get_or_create_end_user(application_id, external_user_id, threshold=None, met
         "external_user_id": external_user_id,
         "metadata": metadata or {},
     }
-    if threshold is not None:
-        payload["threshold"] = float(threshold)
 
     created = supabase.table("end_users").insert(payload).execute()
     return (created.data or [None])[0]
@@ -844,6 +843,32 @@ def revoke_platform_api_key(api_key_id):
     return jsonify({"status": "revoked", "api_key": public_api_key_row(key_row)})
 
 
+@app.patch("/v1/apps/<application_id>/threshold")
+@limiter.limit(PLATFORM_WRITE_RATE_LIMIT)
+@require_api_key
+def set_application_threshold(application_id):
+    if request.cadence_application["application_id"] != application_id:
+        return error_response("forbidden", 403, "forbidden")
+
+    data = get_json_body()
+    threshold = data.get("threshold")
+    if threshold is None:
+        return error_response("missing threshold")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        return error_response("threshold must be a number")
+    if not (0.0 <= threshold <= 1.0):
+        return error_response("threshold must be between 0 and 1")
+
+    supabase.table("applications") \
+        .update({"threshold": threshold}) \
+        .eq("application_id", application_id) \
+        .execute()
+
+    return jsonify({"status": "ok", "application_id": application_id, "threshold": threshold})
+
+
 @app.post("/v1/end-users")
 @limiter.limit(PLATFORM_WRITE_RATE_LIMIT)
 @require_api_key
@@ -860,7 +885,6 @@ def create_platform_end_user():
     end_user = get_or_create_end_user(
         request.cadence_application["application_id"],
         external_user_id,
-        threshold=data.get("threshold"),
         metadata=metadata,
     )
     return jsonify({
@@ -947,7 +971,7 @@ def platform_score():
     app_id = request.cadence_application["application_id"]
     end_user = get_or_create_end_user(app_id, external_user_id)
     enrollment = platform_enrollment_payload(end_user["end_user_id"])
-    threshold = float(data.get("threshold") or end_user.get("threshold") or 0.5)
+    threshold = float(request.cadence_application.get("threshold") or DEFAULT_THRESHOLD)
 
     score_started = time.perf_counter()
     score = None
@@ -1081,21 +1105,12 @@ def signup():
     if not user_id:
         return jsonify({"status": "error", "message": "signup did not return user id"}), 400
 
-    print({
-        "user_id": user_id,
-        "username": username,
-        "email": email,
-        "threshold": 0.5,
-        "current_login_status": None,
-        "number_login_attempts": 0
-    })
     # create local user_profiles row for biometric login data
     try:
         supabase.table("user_profiles").insert({
             "user_id": user_id,
             "username": username,
             "email": email,
-            "threshold": 0.5,
             "current_login_status": None,
             "number_login_attempts": 0,
             "failed_password_attempts": 0,
@@ -1250,12 +1265,7 @@ def authenticate():
         .eq("login_attempt_id", login_attempt_id) \
         .execute()
     
-    # get user's threshold 
-    threshold_result = supabase.table("user_profiles") \
-                .select("threshold") \
-                .eq("user_id", user_id) \
-                .execute()
-    threshold = threshold_result.data[0]["threshold"]
+    threshold = DEFAULT_THRESHOLD
     app.logger.info("threshold: %s", threshold)
 
     # check it
