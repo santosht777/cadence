@@ -31,6 +31,7 @@ except ImportError:
     from model_service import CadenceModelService
 
 app = Flask(__name__)
+app.logger.setLevel("INFO")
 # Trust one level of X-Forwarded-For so the rate limiter sees the real
 # client IP rather than the hosting platform's proxy address.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
@@ -1306,6 +1307,7 @@ def authenticate():
                 .eq("user_id", user_id) \
                 .execute()
     threshold = threshold_result.data[0]["threshold"]
+    app.logger.info("threshold: %s", threshold)
 
     # check it
     if (score >= threshold):
